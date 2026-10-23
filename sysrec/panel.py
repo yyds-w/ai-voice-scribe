@@ -23,6 +23,15 @@ PANEL_H = 186          # 2026-10-19：下方提示区高度减半（原 43px →
 REC_PANEL_H = 190      # 录音态需要更高的面板，容纳计时 / 电平 / 按钮
 ICON_SIDE = 72         # 卡片图标显示边长（图标为"圆盘+字形"整体，源图 324px）
 
+# 2026-10-23：toast 动作按钮行（打开目录/改名…/丢弃）的临时加高量。
+# 根因：186px 只按"纯文字 toast"设计（卡片底 164，底部仅剩 22px），
+# 按钮行是占布局控件（26px）→ 被 Qt 挤进卡片区与「开启字幕」重叠 21px。
+# 加高量按两层内容实测：卡片底 164 + 呼吸距 4 + toast 文字 12 + 间距 4
+# + 按钮 26 + 底边距 16 ≈ 46px，取 40（按钮行上方净空由 _place_toast 贴距保证）。
+ACTION_EXTRA_H = 40      # 有动作按钮时窗口临时加高量（186→226）
+ACTION_GAP_BOTTOM = 6    # 动作按钮行距窗口底边的缝（用户 2026-10-23 定：6px）
+FG_TOAST = "#C9D1DC"     # "已保存"提示行文字色：比 FG_DIM 亮一档（用户定）
+
 
 def _icon_path(name: str) -> str:
     return app_paths.resource_path("assets", "panel_%s.png" % name)
@@ -491,7 +500,10 @@ class AiPanel(QWidget):
         self._toast.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._toast.hide()
 
-        # toast 下方的动作按钮行（如"打开目录 / 丢弃"）——有按钮时提示不自动消失
+        # toast 下方的动作按钮行（如"打开目录 / 丢弃"）——有按钮时提示不自动消失。
+        # 2026-10-23 第 2 轮：改为 _frame 上的**绝对定位浮层**（不占布局）。
+        # 原因：占布局时 Qt 实际留底 22px 且构成不可控（隐藏 rec_box 的 spacing
+        # 等混在其中），"贴底缝"调不干净；绝对定位由 _place_actions 钉在底部。
         self._action_box = QWidget(self._frame)
         ar = QHBoxLayout(self._action_box)
         ar.setContentsMargins(0, 0, 0, 0)
@@ -500,7 +512,6 @@ class AiPanel(QWidget):
         self._action_layout = ar
         self._action_btns = []
         self._action_box.hide()
-        v.addWidget(self._action_box)
 
         self._toast_timer = QTimer(self)
         self._toast_timer.setSingleShot(True)
@@ -563,6 +574,18 @@ class AiPanel(QWidget):
     def set_levels(self, rms01: float, peak01: float) -> None:
         self._meter.set_levels(rms01, peak01)
 
+    # ---------- 录音卡片：同一个按钮切换状态（2026-10-23 Q6=A）----------
+
+    REC_IDLE_TEXT = "● 开始应用录音"
+
+    def set_record_time(self, hms: str) -> None:
+        """录音中：卡片按钮文案变成「■ 录音中 HH:MM:SS」（点击它=停止并保存）。"""
+        self._card_rec.setText("■ 录音中 %s" % hms)
+
+    def set_record_idle(self) -> None:
+        """空闲：卡片文案回到「● 开始应用录音」。"""
+        self._card_rec.setText(self.REC_IDLE_TEXT)
+
     # ---------- 卡片状态（2026-10-20）----------
 
     def card(self, name: str):
@@ -615,8 +638,38 @@ class AiPanel(QWidget):
         self._toast_timer.start(ms)
 
     def toast_actions(self, text: str, actions) -> None:
-        """兼容壳：动作按钮已迁到录音窗（2026-10-18 用户要求），这里只显示文字。"""
-        self.toast(text, 6000)
+        """底部轻提示 + 动作按钮（2026-10-23：独立录音窗移除后，"已保存"态
+        的 打开目录 / 改名… / 丢弃 搬到这里——全程不弹窗，Q6=A）。
+
+        actions: [(label, callback), ...]。有按钮时提示不自动消失，
+        点任一按钮 / 下一条提示到来时收起。
+
+        2026-10-23 修复：按钮行占布局，186px 的固定高度放不下（曾与「开启
+        字幕」卡片重叠 21px，见 _grow_for_actions 注释）。进入时临时加高。
+        """
+        self._clear_actions()
+        self._grow_for_actions()
+        self._toast.setStyleSheet(
+            "color:%s;font-size:13px;background:transparent;" % FG_TOAST)
+        self._toast.setText(text)
+        self._toast.adjustSize()
+        self._toast.show()
+        for label, cb in (actions or []):
+            b = QPushButton(label, self._frame)
+            b.setFixedHeight(26)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setStyleSheet(
+                "QPushButton{background:rgba(255,255,255,0.16);border:none;"
+                "border-radius:8px;color:%s;font-size:12px;padding:0 12px;}"
+                "QPushButton:hover{background:rgba(255,255,255,0.28);}" % FG)
+            b.clicked.connect(self._mk_action(cb))
+            self._action_layout.addWidget(b)
+            self._action_btns.append(b)
+        if self._action_btns:
+            self._place_actions()              # 贴底定位（绝对定位浮层，第 2 轮）
+            self._action_box.show()
+            self._toast_timer.stop()          # 有按钮：不自动消失
+        self._place_toast()
 
     def _mk_action(self, cb):
         def _go():
@@ -634,6 +687,48 @@ class AiPanel(QWidget):
         box = getattr(self, "_action_box", None)
         if box is not None:
             box.hide()
+        toast = getattr(self, "_toast", None)
+        if toast is not None:
+            toast.hide()               # 按钮收起来，提示条一起收（toast() 会重新显示）
+        self._shrink_after_actions()
+
+    def _grow_for_actions(self) -> None:
+        """有动作按钮时把面板临时加高 ACTION_EXTRA_H（向下长，顶边不动）。
+
+        为什么加高：PANEL_H=186 是 10-19 按"纯文字 toast"定的（卡片底 164，
+        底部仅剩 22px）。按钮行是占布局控件（26px），总高度超限时 Qt 把它
+        挤进卡片区——实测与「开启字幕」卡片重叠 21px（dev/_diag_toast_overlap.py）。
+        加高后布局自然重排：卡片不动（顶边锚定），按钮行落到底部空白区。
+        重复调用幂等（已加高则跳过）；加高只改 setFixedSize，原点不变，
+        显式 move 回原位是双保险（防个别平台上 resize 引起原点漂移）。
+        """
+        if self.height() >= PANEL_H + ACTION_EXTRA_H:
+            return
+        pos = self.pos()
+        self.setFixedSize(PANEL_W, PANEL_H + ACTION_EXTRA_H)
+        self.move(pos)                    # 顶边不动，向下长
+
+    def _shrink_after_actions(self) -> None:
+        """动作按钮收起后还原面板高度（与 _grow_for_actions 成对）。"""
+        if self.height() <= PANEL_H:
+            return
+        pos = self.pos()
+        self.setFixedSize(PANEL_W, PANEL_H)
+        self.move(pos)                    # 顶边不动，底边上收
+
+    def _place_actions(self) -> None:
+        """把动作按钮行钉在窗口底部：距底边 ACTION_GAP_BOTTOM（6px），高 26。
+
+        与 _place_toast 配套使用——toast 在「卡片底 ↔ 按钮顶」之间垂直居中。
+        按钮行是绝对定位浮层（不占布局，见 __init__ 注释），因此这里显式定们。
+        """
+        box = getattr(self, "_action_box", None)
+        if box is None:
+            return
+        btn_h = 26                       # 与 toast_actions() 里 setFixedHeight(26) 一致
+        y = self._frame.height() - ACTION_GAP_BOTTOM - btn_h
+        box.setGeometry(0, y, self._frame.width(), btn_h)
+        box.raise_()                     # 浮层：保证压在卡片/提示之上
 
     def _toast_hide(self) -> None:
         self._clear_actions()
@@ -644,13 +739,22 @@ class AiPanel(QWidget):
 
         2026-10-19 修正：上一版扣掉了底部 16px 边距，居中点上移了 8px，
         视觉上偏上。现在区域取「卡片底 → 窗口底边」，这才是用户看到的"下方区域"。
+        2026-10-23 第 2 轮：有动作按钮时，提示行在「卡片底 ↔ 按钮顶」之间
+        **垂直居中**（用户明确要求）；按钮行由 _place_actions 贴底定位。
         """
         try:
             cards_bottom = self._card_rec.geometry().bottom()
-            region_top = cards_bottom + 1
-            region_bottom = self._frame.height() - 1      # 区域到窗口底边（含原底部边距）
+            box = getattr(self, "_action_box", None)
             h = self._toast.height()
-            y = region_top + max(0, (region_bottom - region_top + 1 - h) // 2)
+            if box is not None and box.isVisible():
+                btn_top = box.geometry().top()
+                # 四舍五入（而非 //2 向下取整）：奇数间隙时上下距差 1px，
+                # 用户要求"垂直居中"，差 1px 在 UI 细节上也看得出来
+                y = cards_bottom + int((btn_top - cards_bottom - h) / 2 + 0.5)
+            else:
+                region_bottom = self._frame.height() - 1   # 区域到窗口底边（含原底部边距）
+                y = cards_bottom + 1 + max(
+                    0, (region_bottom - cards_bottom - h) // 2)
             self._toast.setGeometry(16, y, self._frame.width() - 32, h)
         except Exception:  # noqa: BLE001
             pass

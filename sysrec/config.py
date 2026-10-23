@@ -36,12 +36,22 @@ DEFAULTS = {
     # ---- 字幕节奏 ----
     "subtitle_flush_sec": 1.2,   # 0.6~3.0：活跃行刷新间隔（越小越跟手、越费 CPU）
     "subtitle_first_sec": 0.8,   # 0.4~2.0：一段刚开口后的首刷间隔
-    "subtitle_silence_sec": 0.7, # 0.3~2.0：静音多久算这句说完（定版）
-    "subtitle_max_seg_sec": 15.0,  # 3~20：一直说不停时的强制定版上限；**0 = 取消上限**
-                                   # （只按停顿断句，内部仍有 60s 安全兜底）。
-                                   # 8s 太短：真人连续说话（自我介绍那种）几乎不换气，
-                                   # 实测 11.6 分钟录音有 36% 的段是被 8s 硬切在句子中间的；
-                                   # 流式草稿已经负责实时出字，定版等久一点不影响观感。
+    "subtitle_silence_sec": 0.7, # 0.3~2.0：能量门判定"这句说完了"的静音时长（兜底断句）
+    "subtitle_max_seg_sec": 0.0, # 2026-10-23：默认取消时间上限（原 15s）——断句交给
+                                 # 句尾静音（endpoint）+ 单段字数兜底；>0 时仍按时间强切。
+                                 # 8s 太短：真人连续说话几乎不换气，实测 11.6 分钟录音
+                                 # 36% 的段被硬切在句子中间；流式草稿负责实时出字，
+                                 # 定版等多久都不影响观感。
+    "subtitle_endpoint_sec": 1.0,  # 0.2~1.0：模型级端点检测的句尾静音（Paraformer
+                                   # is_endpoint rule1）。2026-10-23 实测修正：0.4s 太
+                                   # 敏感——Paraformer 把句中停顿也当句尾，真人语音每
+                                   # ~1.8s 切一刀、每行只剩 2~4 字（真值比对膨胀率 7.25）。
+                                   # 1.0s 过滤句中停顿、保留自然句间停顿。
+    "subtitle_ep_min_chars": 6,    # 1~20：端点触发时的最小字数门槛——不够这么多字就不
+                                   # 定版，残句（"嗯""这个"）攒进下一句。
+    "subtitle_max_chars": 500,   # 200~2000：定版文本达到该字数强制收尾；0 = 不限。
+                                 # 放音乐/噪声时能量门永远不触发"静音"，没有这个兜底
+                                 # 段落会无限变长（字幕一行几千字卡死窗口）。
     "typewriter_ms": 30,         # 10~80：打字机每拍间隔（毫秒），越小吐字越快
     # ---- 字幕外观 ----
     "subtitle_lines": 3,         # 常驻行数
@@ -53,22 +63,25 @@ DEFAULTS = {
     "subtitle_capture_exclude": True,  # 不在录屏/屏幕共享里出现
     "subtitle_x": -1,            # 上次位置（-1 = 贴屏幕底部居中）
     "subtitle_y": -1,
-    # ---- 自动转写 / 自动摘要（2026-10-20 方案 B）----
-    "auto_transcribe": True,      # 录音时后台自动转文字（不弹字幕窗），文稿落盘到 transcript_dir
-    "auto_summary": True,         # 停止录音后自动把转写稿交给 LLM 生成摘要
+    # ---- 自动转写 / 自动摘要 ----
+    # 2026-10-23 用户选择 Q7=B：录音停止后**只保存录音**，转写/摘要改手动触发
+    # （面板「开始 AI 摘要」卡片仍可对最近一份转写稿生成摘要）。
+    # 想恢复"停止即自动转写+摘要"，在设置里把这两项重新勾上即可。
+    "auto_transcribe": False,     # 录音时后台自动转文字（不弹字幕窗），文稿落盘到 transcript_dir
+    "auto_summary": False,        # 停止录音后自动把转写稿交给 LLM 生成摘要
     "transcript_dir": "",         # 空 = 默认 <工具目录>\转写
     "summary_dir": "",            # 空 = 默认 <工具目录>\摘要
     "summary_chunk_chars": 6000,  # 超长转写稿分段摘要的阈值（字）；0 = 不分段
     "summary_segment_minutes": 20,  # 摘要按时段分段（分钟/段）；0 = 按字数分（上一项）
-    # ---- LLM 摘要（OpenAI 兼容：DeepSeek / 通义 / 智谱 / Kimi / Ollama 通用）----
-    "llm_base_url": "https://api.deepseek.com/v1",
-    "llm_api_key": "",            # 存本机 config.json（明文）；也可用环境变量 SYSREC_LLM_KEY 覆盖
-    "llm_model": "deepseek-chat",
-    "llm_temperature": 0.3,       # 低 = 稳定，适合摘要
-    "llm_max_tokens": 2000,       # 摘要长度上限
-    "llm_timeout_sec": 60,
-    "llm_prompt_template": "",    # 空 = 用 llm.py 内置的默认会议纪要模板
-    "llm_confirm_shown": False,   # 隐私确认（文本发往哪个 URL）只问一次
+    # ---- LLM 摘要：多 profile（2026-10-23 用户需求：保存多个 LLM 随心切换）----
+    # 每个 profile 全套参数独立（地址/Key/模型/温度/长度/超时/Prompt，用户 Q1=全套独立）；
+    # llm_active = 当前使用的 profile 名；llm_confirm_shown = {profile名: bool}，
+    # 每个 profile 首次摘要时各自确认一次"文本发往哪个 URL"（用户 Q3）。
+    # 兼容：load() 会把旧的单组 llm_* 键自动迁移成第一个 profile（见 _migrate_llm）。
+    "llm_profiles": [],            # [{name, base_url, api_key, model,
+                                   #   temperature, max_tokens, timeout_sec, prompt_template}]
+    "llm_active": "",              # 当前使用的 profile 名；空 = profiles[0]
+    "llm_confirm_shown": {},       # profile 名 → 是否已弹过发送确认
 }
 
 
@@ -84,8 +97,39 @@ def default_summary_dir() -> str:
     return os.path.join(APP_DIR, "摘要")
 
 
+def _migrate_llm(data: dict, cfg: dict) -> None:
+    """旧单组 llm_* 配置 → llm_profiles[0]（2026-10-23 多 LLM 管理）。
+
+    老用户升级后零丢失：原来填的 base_url / api_key / model / 温度…整体
+    搬进第一个 profile（名字取模型名），llm_active 指向它，隐私确认记录
+    也按 profile 名平移。没有旧配置（全新安装）时什么都不做。
+    """
+    if not isinstance(data, dict):
+        return
+    if data.get("llm_profiles") or cfg.get("llm_profiles"):
+        return                                  # 已是新结构 / 已迁移过
+    if not data.get("llm_base_url"):
+        return                                  # 全新安装：交给用户自己在设置里配
+    model = str(data.get("llm_model") or "").strip()
+    prof = {
+        "name": model or "默认模型",
+        "base_url": str(data.get("llm_base_url") or "").rstrip("/"),
+        "api_key": str(data.get("llm_api_key") or ""),
+        "model": model,
+        "temperature": float(data.get("llm_temperature", 0.3) or 0.3),
+        "max_tokens": int(data.get("llm_max_tokens", 2000) or 2000),
+        "timeout_sec": float(data.get("llm_timeout_sec", 60) or 60),
+        "prompt_template": str(data.get("llm_prompt_template") or ""),
+    }
+    cfg["llm_profiles"] = [prof]
+    cfg["llm_active"] = prof["name"]
+    if data.get("llm_confirm_shown"):
+        cfg["llm_confirm_shown"] = {prof["name"]: True}
+
+
 def load() -> dict:
     cfg = dict(DEFAULTS)
+    data = {}
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -93,6 +137,7 @@ def load() -> dict:
             cfg.update({k: v for k, v in data.items() if k in DEFAULTS})
     except Exception:  # noqa: BLE001  首次运行没有文件 / 文件损坏 → 用默认值
         pass
+    _migrate_llm(data, cfg)
     return cfg
 
 

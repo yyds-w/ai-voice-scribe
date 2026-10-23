@@ -93,7 +93,21 @@ class SubtitleEngine(QObject):
         self.first_sec = float(c.get("subtitle_first_sec", 0.6))
         self.silence_sec = float(c.get("subtitle_silence_sec", 0.7))
         self.min_speech_sec = float(c.get("seg_min_speech", 0.30))
-        self.max_seg_sec = float(c.get("subtitle_max_seg_sec", 15.0))
+        self.max_seg_sec = float(c.get("subtitle_max_seg_sec", 0.0))
+        # 2026-10-23 断句三层（用户 Q6=B/Q10 + Q4/Q5=500 字兜底）：
+        #   1) 模型级端点：Paraformer is_endpoint（rule1 句尾静音 endpoint_sec）
+        #      ——替代原来的 15s 硬切；
+        #   2) 能量门兜底：静音 silence_sec（模型端点漏判时接着兜）；
+        #   3) 字数兜底：定版文本达 max_chars 强切——放音乐/噪声时能量门永远
+        #      不触发"静音"，没有它段落会无限变长（字幕一行几千字卡死窗口）。
+        # max_seg_sec > 0 时仍保留按时间强切（默认已取消：0）。
+        # ep_min_chars：端点触发时的最小字数门槛——2026-10-23 实测 Paraformer
+        # rule1=0.4s 把句中停顿当句尾（每 ~1.8s 一刀、每行 2~4 字），除了把
+        # rule1 放宽到 1.0s，再加这道门槛挡掉识别初期的不稳定残句。
+        self.endpoint_sec = float(c.get("subtitle_endpoint_sec", 1.0))
+        self.ep_min_chars = int(c.get("subtitle_ep_min_chars", 6) or 0)
+        self.max_chars = int(c.get("subtitle_max_chars", 500) or 0)
+        self._ep_hit = False              # 流式块里查到 endpoint → 锁内立即定版
 
     @property
     def running(self):
@@ -169,7 +183,9 @@ class SubtitleEngine(QObject):
         self._stream_tried = True
         try:
             from .stream_asr import StreamingASR
-            m = StreamingASR(threads=2)
+            m = StreamingASR(threads=2,
+                             endpoint_rule1_silence=self.endpoint_sec,
+                             endpoint_max_utterance=60.0)
             if m.ready():
                 m.ensure()
                 self._stream_asr = m
@@ -210,11 +226,33 @@ class SubtitleEngine(QObject):
                 pass
         return self._punct
 
-    def _finalize_stream(self, text):
+    def _punct_confirms(self, text: str):
+        """标点模型语义句界确认（2026-10-23）。
+
+        返回：加标点后的文本（末字符是句末标点 → 这句语义上结束了，可定版）；
+        返回 None（末字符是句中标点/无标点 → 句中停顿，继续攒）。
+        标点模型不可用 → 返回 None 由调用方降级（老逻辑放过）。
+        """
+        t = (text or "").strip()
+        if not t:
+            return None
+        p = self._ensure_punct()
+        if p is None:
+            return None
+        try:
+            marked = (p.add(t) or "").strip()
+        except Exception:  # noqa: BLE001  标点模型出错 → 不确认（降级老逻辑）
+            return None
+        if not marked:
+            return None
+        return marked if marked[-1] in "。！？；!?;" else None
+
+    def _finalize_stream(self, text, already_punct=False):
         """单模型模式的「定版」：**不重转**，只给同一段流式文本补标点后上屏。
 
         这是"不跳字"的关键：定版内容与草稿同源，用户只会看到多了几个标点，
         不会出现"草稿写 A、定版变成 B"的跳变。
+        already_punct=True：文本已由 _punct_confirms 加过标点，跳过重复推理。
         """
         t = (text or "").strip()
         if not t:
@@ -223,9 +261,10 @@ class SubtitleEngine(QObject):
             t = self._asr.fix(t)              # 术语纠错（Redis / String 之类）
         except Exception:                     # noqa: BLE001
             pass
-        p = self._ensure_punct()
-        if p is not None:
-            t = p.add(t)
+        if not already_punct:
+            p = self._ensure_punct()
+            if p is not None:
+                t = p.add(t)
         if t and self._running:
             self.line.emit(t)
 
@@ -258,6 +297,11 @@ class SubtitleEngine(QObject):
                 if r and r != self._stream_text:
                     self._stream_text = r
                     self.partial.emit(r)
+                # 模型级端点（2026-10-23）：这句说完了（rule1 句尾静音）→
+                # 标记，下面进锁后立即定版。比能量门准：判定依据是识别器
+                # 内部帧级声学活动，短促键盘声不会误触。
+                if st.is_endpoint(self._stream_sess):
+                    self._ep_hit = True
             except Exception as e:                    # noqa: BLE001
                 self._stream_asr = None               # 出问题 → 本次起回退老路径
                 self._stream_sess = None
@@ -285,43 +329,51 @@ class SubtitleEngine(QObject):
                 self._silence += len(mono)
             if self._busy:
                 return                              # 上一次识别还没回来：只攒不切
+            ep = self._ep_hit                       # 模型端点：一句说完
+            self._ep_hit = False
+            # 端点 + 最小字数门槛：残句（"嗯""这个"）不够 ep_min_chars 字就不定版，
+            # 攒进下一句（is_endpoint 会持续为真直到新语音进来，攒够自然定版）
+            if ep and self.ep_min_chars > 0:
+                if len(self._stream_text or "") < self.ep_min_chars:
+                    ep = False
             said_done = (self._speech >= int(self.min_speech_sec * SR)
                          and self._silence >= int(self.silence_sec * SR))
-            # max_seg_sec <= 0 = 用户取消了单段上限（只按停顿断句）。
-            # 仍留 60s 兜底：持续噪声（音乐、主播底噪）会让段无限增长，
-            # 识别耗时和内存都会跟着涨，60s 已是"没人会连续说这么久"的安全线。
-            limit = self.max_seg_sec if self.max_seg_sec > 0 else 60.0
-            hard = self._n >= int(limit * SR)
-            if said_done or hard:
-                if self._speech < int(self.min_speech_sec * SR):
+            # 时间上限：max_seg_sec > 0 才按时间强切（默认 0 = 取消，2026-10-23）
+            hard = (self.max_seg_sec > 0
+                    and self._n >= int(self.max_seg_sec * SR))
+            # 字数兜底：定版文本达 max_chars 强切（放音乐时能量门永不触发静音，
+            # 没有它段落会无限变长）。只对 stream 模式有意义（dual 按 60s 音频兜底）。
+            over_chars = (self.max_chars > 0 and self.mode == "stream"
+                          and len(self._stream_text or "") >= self.max_chars)
+            if said_done or hard or ep or over_chars:
+                if self._speech < int(self.min_speech_sec * SR) and not (ep or over_chars):
                     # 纯静音 / 键盘 / 提示音：丢掉，不调模型
-                    self._buf = []
-                    self._n = 0
-                    self._speech = 0
-                    self._silence = 0
-                    self._last_preview = 0
+                    # （ep/over_chars 时一定有话刚说完，speech 可能恰在阈值边缘，不丢）
+                    self._reset_seg_state()
                     return
                 if self.mode == "stream":
                     # 单模型：定版**不重转**，直接拿流式草稿补标点（文字与草稿同源 → 不跳）
                     txt = self._stream_text
-                    self._buf = []
-                    self._n = 0
-                    self._speech = 0
-                    self._silence = 0
-                    self._last_preview = 0
-                    self._stream_sess = None
-                    self._stream_text = ""
-                    self._finalize_stream(txt)
+                    pre = None
+                    if ep:
+                        # 端点 + 标点语义确认（2026-10-23 用户实测反馈：
+                        # "都在不该断点的地方断了"）。is_endpoint 只表示"这里静音
+                        # 够了"，句中换气/犹豫也触发；标点模型才懂"这句话在语义上
+                        # 结束了吗"——末字符是句末标点才放行，否则继续攒。
+                        # 标点模型缺失时降级：按老逻辑（字数门槛已过滤）放过。
+                        pre = self._punct_confirms(txt)
+                        if pre is not None:
+                            txt = pre              # 确认 → 用带标点的版本定版
+                        elif self._ensure_punct() is not None:
+                            ep = False             # 语义未完 → 继续攒
+                            said_done = False      # 同时抑制能量门（否则 0.7s 兜底会抢断）
+                    if ep or said_done or over_chars or hard:
+                        self._reset_seg_state()
+                        self._finalize_stream(txt, already_punct=bool(pre))
                     return
-                audio = np.concatenate(self._buf)
-                self._buf = []
-                self._n = 0
-                self._speech = 0
-                self._silence = 0
-                self._last_preview = 0
+                audio = np.concatenate(self._buf) if self._buf else np.zeros(0, np.float32)
+                self._reset_seg_state()
                 self._kick(audio, final=True)
-                self._stream_sess = None              # 这句结束 → 流式另起一句
-                self._stream_text = ""
                 return
             first = (self._last_preview == 0)
             base = self.first_sec if first else self.flush_sec
@@ -331,6 +383,20 @@ class SubtitleEngine(QObject):
                 self._last_preview = self._n
                 if self._stream_asr is None:          # 流式接管草稿时不再跑老预览（省 CPU）
                     self._kick(np.concatenate(self._buf), final=False)
+
+    def _reset_seg_state(self):
+        """定版后重置一段的状态（缓冲/计时/流式句）。
+
+        流式 session 置 None：下一块音频进来时 new_session()——相当于
+        reset 效果（endpoint 命中后必须开新流，否则下一句会粘进同一段）。
+        """
+        self._buf = []
+        self._n = 0
+        self._speech = 0
+        self._silence = 0
+        self._last_preview = 0
+        self._stream_sess = None
+        self._stream_text = ""
 
     def _kick(self, audio, final):
         self._seq += 1

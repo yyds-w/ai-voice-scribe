@@ -18,15 +18,15 @@ from PyQt6.QtCore import QDateTime, QPoint, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QCursor, QIcon, QLinearGradient, QPainter, QPen
 from PyQt6.QtWidgets import (QApplication, QComboBox, QDialog, QFileDialog,
                              QHBoxLayout, QLabel, QMainWindow, QMenu,
-                             QMessageBox, QPushButton, QSystemTrayIcon,
+                             QPushButton, QSystemTrayIcon,
                              QVBoxLayout, QWidget)
 
 from . import app_paths
 from . import config as config_mod
 from . import devices
+from . import msgbox
 from .recorder import Recorder, RecorderConfig
 from .panel import AiPanel
-from .record_window import RecordWindow
 from .settings_dialog import SettingsDialog
 from .subtitle import SubtitleEngine
 from .transcript import Transcript
@@ -247,6 +247,8 @@ class MainWindow(QMainWindow):
         self.sub_engine = None
         # 转写稿 / 摘要
         self.transcript = None             # 当前这次录音的 Transcript
+        self._last_transcript_path = ""    # 本次会话最后一份落盘的转写稿（摘要素材用，
+                                           # 不用目录里"最新"的旧稿，见 _on_panel_summary）
         self._summary_busy = False
         self._summary_auto = False         # True = 自动跑的摘要（完成后不弹模态框）
         self._last_summary_path = ""
@@ -476,7 +478,9 @@ class MainWindow(QMainWindow):
                 os.remove(info.get("path") or "")
             except Exception:                     # noqa: BLE001
                 pass
+            self._last_transcript_path = ""      # 本次没内容 → 不留给摘要当素材
             return ""
+        self._last_transcript_path = info.get("path") or ""   # 本次会话刚落盘的稿
         try:
             return t.text()
         except Exception:                         # noqa: BLE001
@@ -501,17 +505,6 @@ class MainWindow(QMainWindow):
         self.btn_sub.setText("关闭实时字幕")
         self._panel.set_card_state("subtitle", "active")
         return True
-
-    def _latest_transcript_path(self) -> str:
-        """转写目录里最新的一份（按文件名里的时间戳）。"""
-        d = self._transcript_dir()
-        try:
-            names = [n for n in os.listdir(d) if n.startswith("转写_") and n.endswith(".md")]
-        except Exception:                         # noqa: BLE001
-            return ""
-        if not names:
-            return ""
-        return os.path.join(d, sorted(names)[-1])
 
     def _update_dir_label(self) -> None:
         d = self._out_dir()
@@ -696,16 +689,13 @@ class MainWindow(QMainWindow):
     # ---------------- LLM 摘要 ----------------
 
     def _llm_cfg(self) -> dict:
-        c = self.cfg
-        return {
-            "base_url": c.get("llm_base_url", ""),
-            "api_key": c.get("llm_api_key", ""),
-            "model": c.get("llm_model", ""),
-            "temperature": c.get("llm_temperature", 0.3),
-            "max_tokens": c.get("llm_max_tokens", 2000),
-            "timeout_sec": c.get("llm_timeout_sec", 60),
-            "prompt_template": c.get("llm_prompt_template", ""),
-        }
+        """当前激活的 LLM profile → LlmClient 扁平配置（2026-10-23 多 LLM）。
+
+        没有 profile（没配过 / 全删了）→ 返回 {}，调用方按"未配置"处理。
+        """
+        from .llm import active_profile, profile_client_cfg
+        prof = active_profile(self.cfg)
+        return profile_client_cfg(prof) if prof else {}
 
     @_guard_qt_callback
     def _on_sub_summary(self) -> None:
@@ -717,29 +707,45 @@ class MainWindow(QMainWindow):
             return
         self._start_summary("\n".join(lines), auto=False)
 
+    def _resolve_summary_text(self):
+        """摘要素材解析（2026-10-23 用户方案 B：本次没有稿就取消，绝不拿历史旧稿充数）。
+
+        返回 (text, src, reason)：
+          reason="live"    = 当前会话内存里的转写稿（录音中/刚停止）
+          reason="session" = 本次会话刚落盘的那份（停止时收尾的）
+          reason="none"   = 本次没有任何转写稿 → 调用方取消摘要并引导
+        刻意不用 `_latest_transcript_path()`（目录里文件名最新的稿）——那是
+        别次录音/别天开的字幕留下的历史稿，静默用它就是"摘要内容是上一段音频"
+        bug 的根因（Q7=B 关自动转写后，纯录音永远没有本次稿）。
+        """
+        t = self.transcript
+        if t is not None and len(t):
+            return t.text(), (t.path or ""), "live"
+        p = self._last_transcript_path
+        if p:
+            try:
+                text = Transcript.load(p).text()
+            except Exception:                    # noqa: BLE001  文件被删/损坏 → 当没有
+                text = ""
+            if text.strip():
+                return text, p, "session"
+        return "", "", "none"
+
     @_guard_qt_callback
     def _on_panel_summary(self) -> None:
-        """面板「开始 AI 摘要」：对本次/最近一份转写稿生成纪要。"""
+        """面板「开始 AI 摘要」：对**本次**转写稿生成纪要（方案 B）。"""
         if self._summary_busy:
             self._panel.toast("摘要正在生成中，请稍候…", 2500)
             return
         if self._recording:
             self._panel.toast("录音中——停止并保存后会自动生成摘要。", 3500)
             return
-        text, src = "", ""
-        t = self.transcript
-        if t is not None and len(t):
-            text, src = t.text(), (t.path or "")
-        if not text:
-            p = self._latest_transcript_path()          # 重启后也能对"上一次"再摘要
-            if p:
-                try:
-                    text, src = Transcript.load(p).text(), p
-                except Exception:                        # noqa: BLE001
-                    text = ""
-        if not text.strip():
-            self._panel.toast("还没有转写稿：先录音（会自动转文字）或开启字幕。", 4000,
-                              warn=True)
+        text, src, reason = self._resolve_summary_text()
+        if reason == "none":
+            # B 方案：本次没有转写稿 → 取消本次摘要 + 正确引导（不碰历史旧稿）
+            self._panel.toast(
+                "本次录音没有转写稿（设置里「录音时后台自动转文字」当前是关的）。"
+                "要生成摘要：开启字幕录音，或在设置里把它打开。", 6000, warn=True)
             return
         self._panel.toast("正在用 %d 字转写稿生成摘要…" % len(text), 4000)
         self._start_summary(text, auto=True, src=src)
@@ -752,23 +758,31 @@ class MainWindow(QMainWindow):
             return
         if self._summary_busy:
             return
-        if not self.cfg.get("llm_api_key", ""):
-            self._set_status("还没配 API Key（设置 → LLM 摘要），摘要生成不了", warn=True)
-            self._panel.toast("摘要需要先在设置里填 API Key。", 4500, warn=True)
+        from .llm import active_profile
+        prof = active_profile(self.cfg)
+        if prof is None:
+            self._set_status("还没配 LLM（设置 → LLM 摘要 → 新建），摘要生成不了", warn=True)
+            self._panel.toast("摘要需要先在设置里配一个 LLM。", 4500, warn=True)
             return
-        if not self.cfg.get("llm_confirm_shown", False):
-            base = self.cfg.get("llm_base_url", "") or "（未配置）"
-            r = QMessageBox.question(
-                self, "发送确认",
-                "将把本次转写（约 %d 字）发往：\n%s\n\n继续生成摘要？" % (len(text), base),
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-            if r != QMessageBox.StandardButton.Yes:
+        if not prof.get("api_key", ""):
+            self._set_status("当前 LLM「%s」没填 API Key（设置 → LLM 摘要）" % prof["name"],
+                             warn=True)
+            self._panel.toast("「%s」还没填 API Key。" % prof["name"], 4500, warn=True)
+            return
+        shown = dict(self.cfg.get("llm_confirm_shown") or {})
+        if not shown.get(prof["name"], False):
+            # 每个 profile 首次摘要各自确认一次（URL 不同，隐私意义不同；用户 Q3）
+            if not msgbox.ask(
+                    self, "发送确认",
+                    "将把本次转写（约 %d 字）发往「%s」：\n%s\n\n继续生成摘要？"
+                    % (len(text), prof["name"], prof.get("base_url") or "（未配置）")):
                 return
-            self.cfg["llm_confirm_shown"] = True
+            shown[prof["name"]] = True
+            self.cfg["llm_confirm_shown"] = shown
             config_mod.save(self.cfg)
         self._summary_busy = True
         self._summary_auto = bool(auto)
-        self._set_status("正在生成摘要（LLM，约 10~60 秒）…")
+        self._set_status("正在用「%s」生成摘要（约 10~60 秒）…" % prof["name"])
         self._panel.set_card_state("summary", "busy")     # 卡片：处理中
         threading.Thread(target=self._summary_work, args=(text, src),
                          daemon=True).start()
@@ -807,8 +821,8 @@ class MainWindow(QMainWindow):
             self._set_status("摘要已生成：%s" % path)
             return
         shown = out[:800] + ("\n……（显示已截断）" if len(out) > 800 else "")
-        QMessageBox.information(self, "摘要已生成",
-                                "%s\n\n完整版与原始字幕已存：\n%s" % (shown, path))
+        msgbox.info(self, "摘要已生成",
+                    "%s\n\n完整版与原始字幕已存：\n%s" % (shown, path))
 
     def _on_summary_fail(self, msg: str) -> None:
         self._summary_busy = False
@@ -841,14 +855,11 @@ class MainWindow(QMainWindow):
 
     @_guard_qt_callback
     def _on_panel_record(self) -> None:
-        """「开始应用录音」：弹独立录音窗（不在面板上改态）；录音中再点只提示。"""
-        if self._recording:
-            self._panel.toast("正在录音中——请先在录音窗点「停止并保存」。", 3000)
-            w = getattr(self, "rec_win", None)
-            if w is not None:
-                w.show()
-                w.raise_()
-            return
+        """「开始应用录音」卡片：同一个按钮切换（2026-10-23 Q6=A）。
+
+        闲时点 = 开始录音（卡片变「■ 录音中 HH:MM:SS」）；
+        录音中再点 = 停止并保存。全程不弹窗——独立录音窗已移除。
+        """
         self._toggle()
 
     @_guard_qt_callback
@@ -881,15 +892,11 @@ class MainWindow(QMainWindow):
             self.rec.resume()
             self.btn_pause.setText("暂停")
             self.meter.set_active(True)
-            if getattr(self, "rec_win", None) is not None:
-                self.rec_win.set_paused(False)
             self._set_status("已继续录音。")
         elif state == "recording":
             self.rec.pause()
             self.btn_pause.setText("继续")
             self.meter.set_active(False)
-            if getattr(self, "rec_win", None) is not None:
-                self.rec_win.set_paused(True)
             self._set_status("已暂停（计时与文件已冻结，点“继续”接着录）。")
 
     def _start_rec(self) -> None:
@@ -912,6 +919,7 @@ class MainWindow(QMainWindow):
             return
         self._recording = True
         self._panel.set_card_state("record", "active")   # 卡片：已开启
+        self._panel.set_record_time("00:00:00")          # 卡片文案：■ 录音中 00:00:00
         self.btn_main.setText("停止并保存")
         self.btn_main.setProperty("recording", True)
         self.btn_main.style().unpolish(self.btn_main)
@@ -924,7 +932,6 @@ class MainWindow(QMainWindow):
         self.meter.set_active(True)
         self.btn_pause.setText("暂停")
         self.btn_pause.setVisible(True)
-        self._open_record_window()
         if self.tray:
             self.act_toggle.setText("停止录音")
             self.tray.setToolTip("AI语音摘要 · 录音中 00:00:00")
@@ -958,6 +965,7 @@ class MainWindow(QMainWindow):
         self.meter.set_active(False)
         self.btn_pause.setVisible(False)
         self._panel.flash_card("record", "done", 1600)    # 卡片：刚保存完（1.6s 后回落）
+        self._panel.set_record_idle()                     # 卡片文案回到「● 开始应用录音」
         self.lbl_time.setText("00:00:00")
         if self.tray:
             self.act_toggle.setText("开始录音")
@@ -970,13 +978,12 @@ class MainWindow(QMainWindow):
                 name += "（等 %d 个文件）" % len(files)
             gap = r.get("gap_seconds", 0.0)
             note = "，补齐静音缺口 %.1f 秒" % gap if gap > 0.5 else ""
-            # 2026-10-18 用户要求：动作按钮放进"录音中"窗口的已保存态
-            rw = getattr(self, "rec_win", None)
-            if rw is not None:
-                rw.show_saved(name, r["seconds"], note)
-            else:
-                self._panel.toast(
-                    "已保存：%s（时长 %.1f 秒%s）。" % (name, r["seconds"], note), 6000)
+            # 2026-10-23 Q6=A：独立录音窗已移除，"已保存"态的动作按钮搬到面板 toast
+            self._panel.toast_actions(
+                "已保存：%s（时长 %.1f 秒%s）" % (name, r["seconds"], note),
+                [("打开目录", self._open_out_dir),
+                 ("改名…", self._rename_last_files),
+                 ("丢弃", self._discard_last_files)])
         else:
             self._set_status("已停止。")
 
@@ -993,32 +1000,8 @@ class MainWindow(QMainWindow):
 
     # ---------------- 停止后的"保存 / 丢弃"流程 ----------------
 
-    # ---------------- 录音窗（独立子窗口，#4682B4） ----------------
-
-    def _open_record_window(self) -> None:
-        if getattr(self, "rec_win", None) is not None:
-            self._close_record_window()       # 关掉上一次的"已保存"窗
-        w = RecordWindow({
-            "panel_opacity": float(self.cfg.get("panel_opacity", 0.80) or 0.80),
-        })
-        w.sig_pause.connect(self._toggle_pause)
-        w.sig_stop.connect(self._toggle)          # 停止并保存
-        w.sig_rename.connect(self._rename_last_files)
-        w.sig_open.connect(self._open_out_dir)
-        w.sig_discard.connect(self._discard_last_files)
-        w.sig_closed.connect(self._close_record_window)
-        self.rec_win = w
-        w.place_near(self._panel)
-        w.show()
-
-    def _close_record_window(self) -> None:
-        w = getattr(self, "rec_win", None)
-        if w is not None:
-            try:
-                w.close()
-            except Exception:  # noqa: BLE001
-                pass
-            self.rec_win = None
+    # （2026-10-23：独立录音窗已移除。"已保存"态的 打开目录 / 改名… / 丢弃
+    #   改为面板 toast 动作按钮，见 _stop_rec → panel.toast_actions）
 
     @_guard_qt_callback
     def _rename_last_files(self) -> None:
@@ -1033,7 +1016,6 @@ class MainWindow(QMainWindow):
         self._last_files = out
         if out:
             self._panel.toast("已改名：%s" % os.path.basename(out[0]), 3000)
-        self._close_record_window()       # 动作完成，收起录音窗
 
     @_guard_qt_callback
     def _discard_last_files(self) -> None:
@@ -1044,7 +1026,6 @@ class MainWindow(QMainWindow):
         self._discard_files(files)
         self._last_files = []
         self._set_status("本次录音已丢弃（文件已移入回收站，可还原）。")
-        self._close_record_window()
 
     def _ask_save_or_discard(self, files, seconds) -> list:
         """停止后询问"保存还是丢弃"。
@@ -1053,17 +1034,12 @@ class MainWindow(QMainWindow):
         对话框与文件操作分离（_ask_save_name / _rename_record_files / _discard_files），
         便于自动化测试直接覆盖各分支。
         """
-        box = QMessageBox(self)
-        box.setWindowTitle("录音已停止")
-        box.setIcon(QMessageBox.Icon.Question)
-        extra = "，共 %d 个文件" % len(files) if len(files) > 1 else ""
-        box.setText("本次录音已停止（时长 %s%s）。\n\n要保存吗？"
-                    % (_fmt_hms(seconds), extra))
-        btn_save = box.addButton("保存（可改文件名）…", QMessageBox.ButtonRole.AcceptRole)
-        btn_drop = box.addButton("不保存（丢弃）", QMessageBox.ButtonRole.DestructiveRole)
-        box.setDefaultButton(btn_save)
-        box.exec()
-        if box.clickedButton() is btn_drop:
+        box = msgbox.choose(
+            self, "录音已停止",
+            "本次录音已停止（时长 %s%s）。\n\n要保存吗？"
+            % (_fmt_hms(seconds), extra),
+            [("保存（可改文件名）…", "ok"), ("不保存（丢弃）", "danger")])
+        if box == "不保存（丢弃）":
             self._discard_files(files)
             return []
         new_path = self._ask_save_name(files[0])
@@ -1144,10 +1120,9 @@ class MainWindow(QMainWindow):
         snap = self.rec.snapshot()
         self.lbl_time.setText(_fmt_hms(snap["seconds"]))
         self.meter.set_levels(_dbfs(snap["level_rms"]), _dbfs(snap["level_peak"]))
-        rw = getattr(self, "rec_win", None)
-        if rw is not None and self._recording:
-            rw.set_time(_fmt_hms(snap["seconds"]))
-            rw.set_levels(snap["level_rms"], snap["level_peak"])
+        if self._recording:
+            # Q6=A：录音卡片实时显示「■ 录音中 HH:MM:SS」
+            self._panel.set_record_time(_fmt_hms(snap["seconds"]))
         if self.tray and self._recording:
             self.tray.setToolTip("AI语音摘要 · 录音中 %s" % _fmt_hms(snap["seconds"]))
 
@@ -1263,11 +1238,7 @@ class MainWindow(QMainWindow):
     def _quit(self) -> None:
         if self._recording:
             # 提示统一下方（2026-10-18）：退出时不弹确认框，避免误操作丢录音
-            self._panel.toast("正在录音——请先在录音窗点「停止并保存」再退出。", 4000, warn=True)
-            w = getattr(self, "rec_win", None)
-            if w is not None:
-                w.show()
-                w.raise_()
+            self._panel.toast("正在录音——请先点录音卡片「停止并保存」再退出。", 4000, warn=True)
             return
         if self._sub_on:
             self._stop_subtitle()          # 退出前把字幕引擎和窗口收干净

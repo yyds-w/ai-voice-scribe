@@ -21,10 +21,18 @@ WASAPI 回环在系统没有任何播放流时不产出数据（PortAudio issue 
 暂停期间丢弃数据；恢复时把时间锚点重设为"当前时刻 - 已写时长"，
 让 E 与已写帧数重新对齐——时间轴不跳、文件不加密。
 
+## 文件命名（2026-10-23「录音来源识别 + 自动命名」）
+录音中一律用临时名 ``临时-时间戳``（Q1=C：录制全程看不到最终名字）；
+stop() 关闭编码器后，按 AudioSourceTracker 锁定的"第一个出声的应用"改名：
+    ``应用名-时间戳.mp3``（Q8=A：半角连字符，无下划线）
+检测不到应用（静音开始 / 只有系统提示音）→ ``系统声音-时间戳.mp3``（Q4=A）。
+分卷的 ``_pNN`` 后缀同步迁移；目标名冲突时自动追加 ``_1``。
+
 ## 线程模型
     PortAudio 回调线程：仅做数据 copy + 入队（不做重活）；
     writer 线程：出队 → 补零 → 编码 → 落盘 → 电平统计 → 分卷判断；
     monitor 线程：每秒盯"默认输出是否变化"（插拔耳机场景），必要时热切换；
+    source 线程（audio_source.AudioSourceTracker）：轮询音频会话电平，锁定来源应用；
     控制线程（调用 start/stop 的线程，GUI=主线程）：防休眠状态按它维护。
 """
 from __future__ import annotations
@@ -39,6 +47,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from . import config as config_mod
+from .audio_source import FALLBACK_NAME, AudioSourceTracker, sanitize_app_name
 from .capture import LoopbackCapture
 from .devices import default_loopback_device
 from .encoder import make_encoder, normalize_fmt
@@ -78,9 +87,11 @@ class RecorderConfig:
     formats: list = field(default_factory=lambda: ["mp3"])   # ["mp3"] / ["wav"] / ["mp3","wav"]
     mp3_bitrate: int = 192
     out_dir: str = ""                    # 空 = <工具目录>\录音
-    prefix: str = "录音"
+    temp_prefix: str = "临时"            # 录音中的临时名前缀（停止时按来源改名）
     segment_minutes: int = 120           # 0 = 不分卷
     follow_default: bool = True          # 录音中默认输出切换时自动跟随续录
+    name_by_source: bool = True          # 停止时按"音频来源应用"命名（2026-10-23）
+    no_source_name: str = FALLBACK_NAME  # 检测不到来源时的名字（Q4=A：系统声音）
 
 
 class Recorder:
@@ -116,6 +127,8 @@ class Recorder:
         self._stopping = False
         self._writer = None
         self._monitor = None
+        self._tracker = None                 # AudioSourceTracker（来源识别）
+        self._file_suffixes = []             # 与 _files 对齐：分段后缀（"" / "_pNN"）
         self._fmt_list = []
 
     # ---------------- 对外 API ----------------
@@ -143,8 +156,10 @@ class Recorder:
         self._fmt_list = [normalize_fmt(f) for f in (self.cfg.formats or ["mp3"])]
         self._out_dir = self.cfg.out_dir or config_mod.default_output_dir()
         os.makedirs(self._out_dir, exist_ok=True)
-        self._stamp = time.strftime("%Y%m%d_%H%M%S")
+        # Q8=A：最终名格式「应用名-年月日时分秒」（无下划线）；录音中用临时名
+        self._stamp = time.strftime("%Y%m%d%H%M%S")
         self._files = []
+        self._file_suffixes = []
         self._seg_index = 1
         self._seg_frames = (int(self.cfg.segment_minutes) * 60 * self._sr
                             if int(self.cfg.segment_minutes or 0) > 0 else 0)
@@ -164,6 +179,7 @@ class Recorder:
         self._writer.start()
         self._monitor = threading.Thread(target=self._monitor_loop, name="sysrec-monitor", daemon=True)
         self._monitor.start()
+        self._start_source_tracker()
 
         self._state = "recording"
         _prevent_sleep(True)
@@ -201,6 +217,20 @@ class Recorder:
             except Exception:  # noqa: BLE001
                 pass
         self._encoders = []
+        # ---- 按音频来源改名（Q1=C：编码器全部关闭后改，此刻没有线程持有文件句柄）----
+        tracker, self._tracker = self._tracker, None
+        app = None
+        if tracker is not None:
+            try:
+                tracker.stop()
+                app = tracker.app_name
+            except Exception:  # noqa: BLE001  tracker 异常不能拖垮停止流程
+                app = None
+        if self.cfg.name_by_source:
+            try:
+                self._rename_by_source(app)
+            except Exception as e:  # noqa: BLE001  改名失败保留临时名，绝不抛
+                self._emit("error", "按来源改名异常（保留临时名）：%s" % e)
         _prevent_sleep(False)
         self._state = "idle"
         result = {
@@ -231,6 +261,7 @@ class Recorder:
     def snapshot(self) -> dict:
         """给 UI 轮询的状态快照（线程安全：均为简单读）。"""
         sr = self._sr or 1
+        tracker = self._tracker
         return {
             "state": self._state,
             "seconds": self._frames_written / sr if self._sr else 0.0,
@@ -242,7 +273,74 @@ class Recorder:
             "sample_rate": self._sr,
             "channels": self._ch,
             "dropped_packets": self._dropped_packets,
+            # 来源识别：录音中实时可见（名字要停止时才落盘，见 _rename_by_source）
+            "source_app": (tracker.app_name if tracker is not None else None),
+            "source_locked": bool(tracker is not None and tracker.app_name),
         }
+
+    # ---------------- 来源识别 / 按来源改名 ----------------
+
+    def _start_source_tracker(self) -> None:
+        """起音频来源识别线程；依赖缺失 / COM 失败时降级（不影响录音）。"""
+        self._tracker = None
+        if not self.cfg.name_by_source:
+            return
+        try:
+            tr = AudioSourceTracker(on_event=self._on_source_event)
+            if tr.start():
+                self._tracker = tr
+            else:
+                self._emit("source_unavailable", tr.error or "来源识别不可用")
+        except Exception as e:  # noqa: BLE001
+            self._tracker = None
+            self._emit("source_unavailable", "%s: %s" % (type(e).__name__, e))
+
+    def _on_source_event(self, kind, payload) -> None:
+        # 跑在 tracker 线程：只转发事件，不做重活
+        self._emit("source_" + kind, payload)
+
+    def _rename_by_source(self, app: str | None) -> None:
+        """停止时按来源改名（Q1=C / Q8=A / Q4=A）。
+
+        app = tracker 锁定的"第一个出声的应用"；None（静音开始 / 只有系统提示音 /
+        tracker 不可用）→ 回落 ``系统声音-时间戳``。分卷 ``_pNN`` 后缀同步迁移。
+        单文件失败只影响该文件（保留临时名 + error 事件），不抛异常。
+        """
+        if not self._files:
+            return
+        name = sanitize_app_name(app) if app else ""
+        base = "%s-%s" % (name or (self.cfg.no_source_name or FALLBACK_NAME),
+                          self._stamp)
+        out, ok = [], True
+        for i, path in enumerate(self._files):
+            seg = self._file_suffixes[i] if i < len(self._file_suffixes) else ""
+            ext = os.path.splitext(path)[1]
+            target = self._avoid_collision(os.path.join(self._out_dir, base + seg + ext))
+            if os.path.abspath(target) != os.path.abspath(path):
+                try:
+                    os.replace(path, target)
+                except OSError as e:
+                    ok = False
+                    out.append(path)
+                    self._emit("error", "按音频来源改名失败（保留临时名）：%s" % e)
+                    continue
+            out.append(target)
+        self._files = out
+        if ok:
+            self._emit("renamed", {"base": base, "app": name or None,
+                                   "files": list(self._files)})
+
+    @staticmethod
+    def _avoid_collision(path: str) -> str:
+        """目标名已存在（同一秒内两次录音等）→ 追加 _1 / _2 …；找不到就原样返回。"""
+        if not os.path.exists(path):
+            return path
+        stem, ext = os.path.splitext(path)
+        for i in range(1, 100):
+            cand = "%s_%d%s" % (stem, i, ext)
+            if not os.path.exists(cand):
+                return cand
+        return path
 
     # ---------------- 内部实现 ----------------
 
@@ -254,16 +352,18 @@ class Recorder:
                 pass
 
     def _open_encoders(self) -> None:
+        """按「临时名-时间戳」开编码器（停止时才按来源改成最终名，见 _rename_by_source）。"""
         self._encoders = []
+        self._files = []
+        self._file_suffixes = []
+        base = "%s-%s" % (self.cfg.temp_prefix, self._stamp)
+        seg = "" if self._seg_index == 1 else "_p%02d" % self._seg_index
         for fmt in self._fmt_list:
-            if self._seg_index == 1:
-                name = "%s_%s.%s" % (self.cfg.prefix, self._stamp, fmt)
-            else:
-                name = "%s_%s_p%02d.%s" % (self.cfg.prefix, self._stamp, self._seg_index, fmt)
-            path = os.path.join(self._out_dir, name)
+            path = os.path.join(self._out_dir, "%s%s.%s" % (base, seg, fmt))
             enc = make_encoder(fmt, path, self._sr, self._ch, self.cfg.mp3_bitrate)
             self._encoders.append(enc)
             self._files.append(path)
+            self._file_suffixes.append(seg)
 
     # --- 采集回调线程（仅 copy + 入队）---
 

@@ -28,6 +28,31 @@ DEFAULT_PROMPT = (
     "只依据文本内容，不要编造；文本太短或不足以摘要时直接说明。"
 )
 
+# ---- Prompt 三档预设（2026-10-23 用户 Q9：简洁/标准/详细）----
+# 设置里"保存模型"旁的预设下拉选中即填入 Prompt 框（可再手改）。
+# 注意：详细度主要由 max_tokens + map-reduce 分段架构决定，Prompt 定风格。
+PROMPT_PRESETS = {
+    "简洁": (
+        "你是会议纪要助手。下面是一场会议/课程/视频的实时转写文本。"
+        "请输出极简中文摘要：\n"
+        "1. 主题（一句话）\n"
+        "2. 核心要点（不超过 3 条，每条一行）\n"
+        "只保留最关键的信息，不要展开细节，不要编造。"
+    ),
+    "标准": DEFAULT_PROMPT,
+    "详细": (
+        "你是会议纪要助手。下面是一场会议/课程/视频的实时转写文本，"
+        "请输出详尽的结构化中文纪要，包含：\n"
+        "1. 主题与背景（一两句话）\n"
+        "2. 核心要点（尽量穷尽，按主题分组，每组 2~5 条，每条说清「谁/做了什么/结论」）\n"
+        "3. 关键数据、数字、时间、人名（原文出现过的，原样保留）\n"
+        "4. 决策与结论（逐条列出）\n"
+        "5. 待办事项（谁、做什么、什么时间；没有就写“无”）\n"
+        "6. 争议或待确认问题（原文中的分歧与开放问题）\n"
+        "只依据文本内容，不要编造；文本太短或不足以摘要时直接说明。"
+    ),
+}
+
 # ---- 长会议 map-reduce：先分段提炼，再合并成一份纪要 ----
 CHUNK_PROMPT = (
     "你是会议纪要助手。下面是一场长会议**其中一段**的实时语音转写。"
@@ -52,6 +77,53 @@ MERGE_PROMPT = (
 
 class LlmError(Exception):
     """带可读原因的 LLM 调用失败（未配置/网络/超时/鉴权/限流/服务端/格式）。"""
+
+
+# ---------- 多 LLM profile（2026-10-23 用户需求：保存多个 LLM 随心切换） ----------
+
+PROFILE_FIELDS = ("name", "base_url", "api_key", "model",
+                  "temperature", "max_tokens", "timeout_sec", "prompt_template")
+
+
+def normalize_profile(p: dict) -> dict:
+    """把一个 profile dict 补齐成规范形态（缺字段给默认值，用于新建/迁移）。"""
+    p = dict(p or {})
+    return {
+        "name": str(p.get("name") or "").strip(),
+        "base_url": str(p.get("base_url") or DEFAULT_BASE_URL).rstrip("/"),
+        "api_key": str(p.get("api_key") or ""),
+        "model": str(p.get("model") or DEFAULT_MODEL),
+        "temperature": float(p.get("temperature", 0.3) or 0.3),
+        "max_tokens": int(p.get("max_tokens", 2000) or 2000),
+        "timeout_sec": float(p.get("timeout_sec", 60) or 60),
+        "prompt_template": str(p.get("prompt_template") or ""),
+    }
+
+
+def active_profile(cfg: dict):
+    """按 cfg['llm_active'] 从 cfg['llm_profiles'] 里找当前 profile。
+
+    返回规范化后的 profile dict；没有 profile / 找不到激活名（被删/改名）
+    → 降级返回第一个；一个都没有 → None。
+    """
+    profs = [normalize_profile(p) for p in (cfg.get("llm_profiles") or [])
+             if isinstance(p, dict)]
+    profs = [p for p in profs if p["name"]]
+    if not profs:
+        return None
+    name = str(cfg.get("llm_active") or "")
+    for p in profs:
+        if p["name"] == name:
+            return p
+    return profs[0]
+
+
+def profile_client_cfg(profile: dict) -> dict:
+    """profile → LlmClient(cfg) 吃的扁平 dict。"""
+    p = normalize_profile(profile)
+    return {k: p[k] for k in ("base_url", "api_key", "model",
+                              "temperature", "max_tokens", "timeout_sec",
+                              "prompt_template")}
 
 
 def _classify_http_error(code: int) -> str:

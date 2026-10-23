@@ -32,12 +32,23 @@ TOKENS = os.path.join(MODEL_DIR, "tokens.txt")
 
 
 class StreamingASR:
-    """流式识别器（懒加载；session = 一条独立的识别流）。"""
+    """流式识别器（懒加载；session = 一条独立的识别流）。
 
-    def __init__(self, threads: int = 2):
+    endpoint 检测（2026-10-23）：from_paraformer 开启
+    enable_endpoint_detection，rule1 = 拖尾静音多久算一句说完（用户可调，
+    见 config.subtitle_endpoint_sec，默认 0.4s——覆盖自然换气）。rule2
+    （按标点断句）需要 rule_fsts，流式模型包不带，不生效；rule3 = 长度
+    兜底，由调用方按字数管（见 subtitle.subtitle_max_chars），这里只开
+    rule1。is_endpoint() 命中后调用方定版并 new_session（= reset 效果）。
+    """
+
+    def __init__(self, threads: int = 2, endpoint_rule1_silence: float = 0.4,
+                 endpoint_max_utterance: float = 60.0):
         self._threads = max(1, int(threads))
         self._rec = None
         self._lock = threading.Lock()
+        self._rule1 = max(0.1, float(endpoint_rule1_silence))
+        self._rule3 = max(5.0, float(endpoint_max_utterance))
 
     def ready(self) -> bool:
         return all(os.path.exists(p) for p in (ENCODER, DECODER, TOKENS))
@@ -59,6 +70,9 @@ class StreamingASR:
                 sample_rate=SR,
                 feature_dim=80,
                 decoding_method="greedy_search",
+                enable_endpoint_detection=True,            # 句尾静音断句（rule1）
+                rule1_min_trailing_silence=self._rule1,
+                rule3_min_utterance_length=self._rule3,    # 超长兜底
             )
             return self._rec
 
@@ -80,6 +94,13 @@ class StreamingASR:
             return (self.ensure().get_result(session) or "").strip()
         except Exception:  # noqa: BLE001
             return ""
+
+    def is_endpoint(self, session) -> bool:
+        """模型判定"这句话说完了"（rule1 拖尾静音）。异常一律当没说完。"""
+        try:
+            return bool(self.ensure().is_endpoint(session))
+        except Exception:  # noqa: BLE001
+            return False
 
     def reset(self, session) -> None:
         try:

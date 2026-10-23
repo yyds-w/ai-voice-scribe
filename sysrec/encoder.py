@@ -60,6 +60,10 @@ class Mp3Encoder:
             tail = self._e.flush()
             if tail:
                 self._f.write(tail)
+        except RuntimeError:
+            # 整段一个样本都没写过（秒录秒停 / 设备未就绪）时 lameenc 的 flush
+            # 会抛 "Not currently encoding"——空段也必须能正常收尾，不能炸保存流程
+            pass
         finally:
             self._f.close()
 

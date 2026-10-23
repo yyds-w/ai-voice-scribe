@@ -6,13 +6,18 @@
 """
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt
+import threading
+
+from PyQt6.QtCore import Qt, QObject, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (QCheckBox, QComboBox, QDialog, QFrame,
-                             QHBoxLayout, QLabel, QLineEdit, QMessageBox,
+                             QHBoxLayout, QLabel, QLineEdit, QListWidget,
+                             QListWidgetItem, QPlainTextEdit,
                              QPushButton, QScrollArea, QSlider, QVBoxLayout,
                              QWidget)
 
 from . import config as config_mod
+from . import llm as llm_mod
+from . import msgbox
 
 
 class _NoWheelSlider(QSlider):
@@ -55,7 +60,17 @@ SPECS = [
      "但一句要等更久才定版；调小 → 出字更碎。默认 15。"
      "如果连续说话时句子被拦腰切断，就往上加。"),
     ("subtitle_silence_sec", "字幕节奏", "定版静音", 0.30, 2.00, 0.10, "s",
-     "说完后静音多久把这句话定版。调小 → 出字快，但句子更碎。默认 0.7。"),
+     "说完后静音多久把这句话定版（能量门兜底）。调小 → 出字快，但句子更碎。默认 0.7。"),
+    ("subtitle_endpoint_sec", "字幕节奏", "句尾静音", 0.20, 1.00, 0.05, "s",
+     "模型判定“这句话说完了”需要的句尾静音（默认 1.0）。2026-10-23 实测：0.4s 太"
+     "敏感——句中停顿也被当句尾，每行只剩 2~4 字；1.0s 过滤句中停顿、保留自然句间停顿。"
+     "调小 → 句子更碎；调大 → 只认明显的句间停顿。"),
+    ("subtitle_ep_min_chars", "字幕节奏", "端点最小字数", 1, 20, 1, "字",
+     "端点触发时不够这么多字就不定版（默认 6）——“嗯”“这个”级残句攒进下一句，"
+     "挡掉识别初期的不稳定碎片。调大 → 行更少更长；调小 → 更接近原始断句。"),
+    ("subtitle_max_chars", "字幕节奏", "单段字数", 200, 2000, 100, "字",
+     "定版文本达到该字数就强制收尾。防止放音乐 / 噪声时段落无限变长"
+     "（字幕一行几千字会卡窗口）。默认 500。"),
     ("subtitle_flush_sec", "字幕节奏", "活跃行刷新", 0.60, 3.00, 0.10, "s",
      "多久刷新一次灰色活跃行。越小越跟手、越费 CPU（默认 1.2，约 11% 单核）。"),
     ("subtitle_first_sec", "字幕节奏", "首字等待", 0.40, 2.00, 0.10, "s",
@@ -97,7 +112,13 @@ CHOICES = {
 # 这些参数支持"取消限制"：勾选后值写 0，引擎按"只靠停顿断句"处理
 DISABLE_SPECS = {
     "subtitle_max_seg_sec": "取消单段上限（只按停顿断句）",
+    "subtitle_max_chars": "不限单段字数（放音乐时段落可能变得很长）",
 }
+
+
+class _TestSig(QObject):
+    """测试连接的工作线程 → 对话框主线程（2026-10-23：网络差时不再卡死 UI）。"""
+    test_done = pyqtSignal(bool, str)          # (ok, message)
 
 PRESETS = {
     "默认平衡": {},
@@ -130,6 +151,11 @@ class SettingsDialog(QDialog):
         self.cfg = dict(cfg)
         self.result_cfg = None
         self._rows = {}                     # key -> (slider, value_lbl, spec, step)
+        self._testing = False               # LLM 测试连接进行中（防重复点击）
+        self._test_btn = None               # 「测试连接」按钮（线程化后要禁用/还原）
+        self._save_btn = None               # 「保存模型」按钮（落盘后短暂显示"已保存 ✓"）
+        self._sig = _TestSig()
+        self._sig.test_done.connect(self._on_test_done)
 
         self.setWindowTitle("实时转文字 · 设置")
         self.setMinimumWidth(600)
@@ -378,8 +404,13 @@ class SettingsDialog(QDialog):
             self._rows[key] = (ed, None, None, None)
         return card
 
-    # ---------- LLM 摘要卡片 ----------
+    # ---------- LLM 摘要卡片（2026-10-23 多 LLM 管理） ----------
     def _llm_card(self):
+        """多 profile 管理：左侧列表（名称+当前标记）+ 右侧字段编辑。
+
+        数据自管理（self._profiles / self._active / self._cur），不进 _rows——
+        _save() 末尾统一写回 cfg（见 _save）。字段与 llm.PROFILE_FIELDS 对齐。
+        """
         card = QFrame()
         card.setObjectName("card")
         v = QVBoxLayout(card)
@@ -389,58 +420,317 @@ class SettingsDialog(QDialog):
         h.setObjectName("grp")
         h.setStyleSheet("color:%s;font-size:13px;" % TEXT)
         v.addWidget(h)
-        tip = QLabel("配置任意 OpenAI 兼容服务（DeepSeek / 通义 / 智谱 / Kimi / 本地 Ollama），"
-                     "字幕窗的「摘要」按钮就会把字幕交给它生成结构化纪要。")
+        tip = QLabel("可保存多个 LLM（DeepSeek / 通义 / 智谱 / Kimi / 本地 Ollama…），"
+                     "摘要时用标记了「当前」的那个。每个模型的地址、Key、参数各自独立。")
         tip.setObjectName("hint")
         tip.setWordWrap(True)
         v.addWidget(tip)
 
-        rows = (
-            ("llm_base_url", "API 地址", "OpenAI 兼容端点，如 https://api.deepseek.com/v1；"
-             "本地 Ollama 填 http://localhost:11434/v1", False),
-            ("llm_api_key", "API Key", "保存在本机 config.json；也可用环境变量 "
-             "SYSREC_LLM_KEY 覆盖", True),
-            ("llm_model", "模型名", "如 deepseek-chat / qwen-plus / glm-4-air", False),
-        )
-        for key, label, hint, secret in rows:
+        # ---- 数据 ----
+        self._profiles = [llm_mod.normalize_profile(p)
+                          for p in (self.cfg.get("llm_profiles") or [])
+                          if isinstance(p, dict)]
+        self._profiles = [p for p in self._profiles if p["name"]]
+        self._active = str(self.cfg.get("llm_active") or "")
+        if self._active not in [p["name"] for p in self._profiles]:
+            self._active = self._profiles[0]["name"] if self._profiles else ""
+        self._cur = 0
+
+        body = QHBoxLayout()
+        body.setSpacing(12)
+
+        # 左：profile 列表
+        self._prof_list = QListWidget()
+        self._prof_list.setMaximumWidth(190)
+        self._prof_list.setStyleSheet(
+            "QListWidget{background:rgba(255,255,255,0.06);border:none;border-radius:8px;}"
+            "QListWidget::item{padding:7px 8px;border-radius:6px;color:%s;}"
+            "QListWidget::item:selected{background:rgba(79,163,227,0.35);color:#FFFFFF;}" % TEXT)
+        self._prof_list.currentRowChanged.connect(self._on_prof_row)
+        body.addWidget(self._prof_list)
+
+        # 右：字段编辑
+        form = QVBoxLayout()
+        form.setSpacing(8)
+        self._prof_edits = {}
+        for field, label, secret, multi in (
+                ("name", "名称", False, False),
+                ("base_url", "API 地址", False, False),
+                ("api_key", "API Key", True, False),
+                ("model", "模型名", False, False),
+                ("temperature", "温度", False, False),
+                ("max_tokens", "长度上限", False, False),
+                ("timeout_sec", "超时(秒)", False, False),
+                ("prompt_template", "Prompt", False, True)):
             row = QHBoxLayout()
             row.setSpacing(10)
             lab = QLabel(label)
-            lab.setFixedWidth(100)
+            lab.setFixedWidth(76)
             row.addWidget(lab)
-            edit = QLineEdit(str(self.cfg.get(key, "") or ""))
-            edit.setPlaceholderText(hint.split("；")[0])
-            edit.setToolTip(hint)
-            if secret:
-                edit.setEchoMode(QLineEdit.EchoMode.Password)
-            row.addWidget(edit, 1)
-            v.addLayout(row)
-            self._rows[key] = (edit, None, None, None)
+            if multi:
+                ed = QPlainTextEdit()
+                ed.setFixedHeight(64)
+                ed.setPlaceholderText("留空 = 用内置的会议纪要模板")
+            else:
+                ed = QLineEdit()
+                ed.setPlaceholderText({
+                    "name": "随便起，如 DeepSeek",
+                    "base_url": "https://api.deepseek.com/v1；本地 Ollama 填 http://localhost:11434/v1",
+                    "api_key": "保存在本机 config.json；也可用环境变量 SYSREC_LLM_KEY 覆盖",
+                    "model": "deepseek-chat / qwen-plus / glm-4-air …",
+                    "temperature": "0.3（低=稳定，适合摘要）",
+                    "max_tokens": "2000",
+                    "timeout_sec": "60",
+                }[field])
+                if secret:
+                    ed.setEchoMode(QLineEdit.EchoMode.Password)
+            ed.setToolTip(ed.placeholderText())
+            row.addWidget(ed, 1)
+            if field == "prompt_template":
+                # 2026-10-23 Q9：Prompt 三档预设（简洁/标准/详细）——选中即填入
+                pc = _NoWheelComboBox()
+                pc.addItem("预设 ↓", "")
+                for k in llm_mod.PROMPT_PRESETS:
+                    pc.addItem(k, k)
+                pc.setToolTip("选中一项就把对应模板填进左边 Prompt 框（填完可再手改）")
+                pc.currentIndexChanged.connect(
+                    lambda _i, c=pc, e=ed: self._apply_prompt_preset(c, e))
+                row.addWidget(pc)
+            form.addLayout(row)
+            self._prof_edits[field] = ed
+        body.addLayout(form, 1)
+        v.addLayout(body, 1)
 
-        trow = QHBoxLayout()
-        tbtn = QPushButton("测试连接")
-        tbtn.setToolTip("发一条最小请求验证配置（最多等 20 秒）")
-        tbtn.clicked.connect(self._test_llm)
-        trow.addWidget(tbtn)
-        trow.addStretch(1)
-        v.addLayout(trow)
+        # 按钮行：新建 → 删除 → 保存模型（就近落盘，不用记着去点右下角「保存」）
+        # → 设为当前 → 测试连接
+        brow = QHBoxLayout()
+        brow.setSpacing(6)
+        for label, slot in (("新建", self._prof_new),
+                            ("删除", self._prof_del),
+                            ("保存模型", self._prof_save),
+                            ("设为当前", self._prof_set_active),
+                            ("测试连接", self._test_llm)):
+            b = QPushButton(label)
+            b.clicked.connect(slot)
+            if label == "测试连接":
+                self._test_btn = b
+                b.setToolTip("发一条最小请求验证配置（最多等 20 秒）")
+            elif label == "保存模型":
+                self._save_btn = b
+                b.setToolTip("把 LLM 配置立即写进 config.json（只存模型，不影响其他设置）")
+            brow.addWidget(b)
+        brow.addStretch(1)
+        v.addLayout(brow)
+
+        self._refresh_prof_list()
         return card
 
+    # ---------- 多 LLM：列表 / 编辑联动 ----------
+
+    def _refresh_prof_list(self):
+        """重建列表并加载当前行。
+
+        ⚠ 全程 blockSignals：setCurrentRow 会触发 currentRowChanged →
+        _on_prof_row → _flush_prof_edits，而此刻右侧控件可能还没加载数据
+        （构造时 / 新建后），会把空值写回 profile 清掉名字。选中行的切换
+        只应由用户真实点击触发（blockSignals 不影响用户交互）。
+        """
+        self._prof_list.blockSignals(True)
+        self._prof_list.clear()
+        for p in self._profiles:
+            label = p["name"] + ("（当前）" if p["name"] == self._active else "")
+            item = QListWidgetItem(label)
+            item.setToolTip("%s · %s" % (p["model"], p["base_url"]))
+            self._prof_list.addItem(item)
+        if self._profiles:
+            row = max(0, min(self._cur, len(self._profiles) - 1))
+            self._prof_list.setCurrentRow(row)
+            self._cur = row
+        self._prof_list.blockSignals(False)
+        self._load_prof_edits()
+
+    def _on_prof_row(self, row):
+        if row < 0 or row >= len(self._profiles):
+            return
+        self._flush_prof_edits()               # 旧行先落盘
+        self._cur = row
+        self._load_prof_edits()
+
+    def _load_prof_edits(self):
+        """把 self._profiles[self._cur] 填进右侧控件；没有 profile 时清空禁用。"""
+        p = self._profiles[self._cur] if 0 <= self._cur < len(self._profiles) else None
+        for field, ed in self._prof_edits.items():
+            val = "" if p is None else p.get(field, "")
+            if isinstance(ed, QPlainTextEdit):
+                ed.setPlainText("" if val is None else str(val))
+            else:
+                ed.setText("" if val is None else str(val))
+            ed.setEnabled(p is not None)
+
+    def _flush_prof_edits(self):
+        """右侧控件 → self._profiles[self._cur]（名称变了要同步 _active）。"""
+        if not (0 <= self._cur < len(self._profiles)):
+            return
+        p = self._profiles[self._cur]
+        old_name = p["name"]
+        for field, ed in self._prof_edits.items():
+            if isinstance(ed, QPlainTextEdit):
+                val = ed.toPlainText().strip()
+            else:
+                val = ed.text().strip()
+            p[field] = val
+        # 名称变化：active 跟着走（用户改的就是当前这个的名字）
+        if p["name"] != old_name:
+            if self._active == old_name:
+                self._active = p["name"]
+            self._refresh_prof_list_labels()
+
+    def _refresh_prof_list_labels(self):
+        """只刷文字（不触发 currentRowChanged，避免打断编辑）。"""
+        self._prof_list.blockSignals(True)
+        for i, p in enumerate(self._profiles):
+            label = p["name"] + ("（当前）" if p["name"] == self._active else "")
+            item = self._prof_list.item(i)
+            if item is not None:
+                item.setText(label)
+                item.setToolTip("%s · %s" % (p["model"], p["base_url"]))
+        self._prof_list.blockSignals(False)
+
+    def _prof_new(self):
+        self._flush_prof_edits()
+        self._profiles.append(llm_mod.normalize_profile(
+            {"name": "新模型 %d" % (len(self._profiles) + 1)}))
+        self._cur = len(self._profiles) - 1
+        self._refresh_prof_list()
+        self._prof_edits["name"].setFocus()
+        self._prof_edits["name"].selectAll()
+
+    def _apply_prompt_preset(self, combo, edit):
+        """Prompt 预设下拉：选中即把模板填进编辑框，然后下拉回位。"""
+        key = combo.currentData()
+        if not key:
+            return
+        tpl = llm_mod.PROMPT_PRESETS.get(key, "")
+        if tpl:
+            edit.setPlainText(tpl)
+        combo.blockSignals(True)
+        combo.setCurrentIndex(0)              # 回提示项，避免同一项重复触发
+        combo.blockSignals(False)
+
+    def _prof_del(self):
+        if not (0 <= self._cur < len(self._profiles)):
+            return
+        self._flush_prof_edits()
+        p = self._profiles[self._cur]
+        if not self._confirm("删除确认",
+                             "确定删除「%s」（%s）吗？" % (p["name"], p["model"])):
+            return
+        self._profiles.pop(self._cur)
+        if self._active == p["name"]:                      # 删的是当前 → 顺延到第一个
+            self._active = self._profiles[0]["name"] if self._profiles else ""
+        self._cur = max(0, min(self._cur, len(self._profiles) - 1))
+        self._refresh_prof_list()
+
+    def _prof_save(self):
+        """「保存模型」：把 LLM 配置立即落盘（2026-10-23 用户需求）。
+
+        解决的真实痛点：新建/编辑完模型后，如果忘记点右下角的总「保存」就关
+        窗口，新模型直接丢。这个按钮就近落盘——只写 LLM 配置（profiles +
+        active），其他设置保持原值不动（不会把改到一半的滑块意外写盘）。
+        校验：名称非空 + 不重名（重名会让 llm_active 指向谁变得不确定）。
+        成功反馈：按钮文字短暂变「已保存 ✓」。
+        """
+        self._flush_prof_edits()
+        if not self._profiles:
+            msgbox.warn(self, "无法保存", "先「新建」一个 LLM。")
+            return
+        names = [p["name"] for p in self._profiles]
+        if any(not n for n in names):
+            msgbox.warn(self, "无法保存", "有模型名称为空——选中它填个名字再保存。")
+            return
+        dup = sorted({n for n in names if names.count(n) > 1})
+        if dup:
+            msgbox.warn(self, "无法保存",
+                        "模型名称重复：%s——改名后再保存。" % "、".join(dup))
+            return
+        self.cfg["llm_profiles"] = self._profiles
+        # active 为空 / 指向已不存在的名字（刚删干净重来）→ 自动设为当前选中，
+        # 否则落盘 llm_active=""，下次启动虽然降级用第一个，但"当前"标记丢了
+        names = [p["name"] for p in self._profiles]
+        if self._active not in names:
+            self._active = self._profiles[self._cur]["name"] \
+                if 0 <= self._cur < len(self._profiles) else names[0]
+        self.cfg["llm_active"] = self._active
+        config_mod.save(self.cfg)                  # 立即落盘（只影响 LLM 相关键）
+        if self._save_btn is not None:
+            self._save_btn.setText("已保存 ✓")
+            QTimer.singleShot(1500, self._restore_save_btn)
+
+    def _restore_save_btn(self):
+        if self._save_btn is not None:
+            self._save_btn.setText("保存模型")
+
+    def _confirm(self, title: str, text: str) -> bool:
+        """是/否确认（独立方法：单测可 patch 掉模态框）。
+
+        2026-10-23：QMessageBox.question 走原生 Windows 消息框会响系统
+        "默认响声"（用户明确不想要）→ 换 msgbox.ask（自绘，无声）。
+        """
+        return msgbox.ask(self, title, text, danger=True)
+
+    def _prof_set_active(self):
+        if not (0 <= self._cur < len(self._profiles)):
+            return
+        self._flush_prof_edits()
+        self._active = self._profiles[self._cur]["name"]
+        self._refresh_prof_list_labels()
+
     def _test_llm(self):
+        """对当前选中的 profile 发一条最小请求（最多等 20 秒）。
+
+        2026-10-23：网络差时卡死设置窗口（标题变"未响应"）的根因是
+        urlopen 同步跑在 GUI 主线程——DNS 解析不受 timeout 控制、响应
+        分块时总时长还会累加。现在请求放工作线程，结果经 _sig.test_done
+        回主线程弹框；按钮禁用 + "测试中…" 防重复点击起一串请求。
+        """
         from .llm import LlmClient, LlmError
-        cfg = {k: (self._rows[k][0].text().strip() if k in self._rows else "")
-               for k in ("llm_base_url", "llm_api_key", "llm_model")}
-        cfg.update({"temperature": self.cfg.get("llm_temperature", 0.3),
-                    "max_tokens": self.cfg.get("llm_max_tokens", 2000),
-                    "timeout_sec": 20})
-        try:
-            reply = LlmClient(cfg).test_connection()
-            QMessageBox.information(self, "连接成功",
-                                    "模型回复：%s" % (reply or "（空回复）"))
-        except LlmError as e:
-            QMessageBox.warning(self, "连接失败", str(e))
-        except Exception as e:  # noqa: BLE001
-            QMessageBox.warning(self, "连接失败", "%s: %s" % (type(e).__name__, e))
+        self._flush_prof_edits()
+        if not (0 <= self._cur < len(self._profiles)):
+            msgbox.warn(self, "无法测试", "先「新建」一个 LLM 再测。")
+            return
+        if self._testing:
+            return
+        p = self._profiles[self._cur]
+        cfg = llm_mod.profile_client_cfg(p)
+        cfg["timeout_sec"] = 20
+        self._testing = True
+        if self._test_btn is not None:
+            self._test_btn.setEnabled(False)
+            self._test_btn.setText("测试中…")
+
+        def work():
+            try:
+                reply = LlmClient(cfg).test_connection()
+                self._sig.test_done.emit(
+                    True, "「%s」回复：%s" % (p["name"], reply or "（空回复）"))
+            except LlmError as e:
+                self._sig.test_done.emit(False, str(e))
+            except Exception as e:  # noqa: BLE001
+                self._sig.test_done.emit(
+                    False, "%s: %s" % (type(e).__name__, e))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_test_done(self, ok: bool, message: str):
+        """工作线程回到主线程：还原按钮 + 静音弹窗显示结果。"""
+        self._testing = False
+        if self._test_btn is not None:
+            self._test_btn.setEnabled(True)
+            self._test_btn.setText("测试连接")
+        if ok:
+            msgbox.info(self, "连接成功", message)
+        else:
+            msgbox.warn(self, "连接失败", message)
 
     # ---------- 取值 / 赋值 ----------
     def _value(self, key):
@@ -510,6 +800,9 @@ class SettingsDialog(QDialog):
         self._apply_preset("默认平衡")
 
     def _save(self):
+        self._flush_prof_edits()                 # LLM 多 profile：右侧编辑先落盘
         self.cfg.update(self._collect())
+        self.cfg["llm_profiles"] = self._profiles
+        self.cfg["llm_active"] = self._active
         self.result_cfg = dict(self.cfg)
         self.accept()
