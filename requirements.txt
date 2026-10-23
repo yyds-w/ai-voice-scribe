@@ -1,0 +1,7 @@
+# AI语音摘要 依赖（venv 重建用：python -m venv venv && venv\Scripts\pip install -r requirements.txt）
+pyaudiowpatch>=0.2.12   # WASAPI 回环采集（录制系统正在播放的声音）
+numpy>=2.0              # 音频缓冲与电平计算
+lameenc>=1.8            # MP3 流式编码（内置 LAME，无需 ffmpeg）
+PyQt6>=6.6              # 图形界面与系统托盘
+pillow>=10              # 图标生成（开发/打包辅助）
+sherpa-onnx>=1.10       # 实时转文字（SenseVoice 本地识别，完全离线）

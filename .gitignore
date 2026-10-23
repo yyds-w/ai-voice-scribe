@@ -1,0 +1,27 @@
+# 依赖与虚拟环境
+venv/
+__pycache__/
+*.py[cod]
+
+# 模型（约 531MB，按 README 单独下载）
+models/
+*.onnx
+
+# 本地配置（含 API Key，仓库只保留 config.example.json）
+config.json
+
+# 录音与转写产物（含真实会议内容，绝不入库）
+录音/
+转写/
+摘要/
+
+# 日志与临时产物
+*.log
+dev/
+.trae-html-share-packages/
+*.lnk
+
+# 系统文件
+Thumbs.db
+desktop.ini
+.DS_Store
