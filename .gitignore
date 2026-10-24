@@ -30,6 +30,9 @@ dev/
 *优化方案*.md
 *任务评估*.md
 
+# 手机端展示页（HTML 演示稿，非产品代码，本地独立维护）
+oneplus11-ai-voice-scribe-ui/
+
 # 系统文件
 Thumbs.db
 desktop.ini
