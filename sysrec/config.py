@@ -18,6 +18,18 @@ DEFAULTS = {
     "segment_minutes": 120,      # 自动分卷时长（分钟）；0 = 不分卷
     "device_index": None,        # None = 自动跟随系统默认输出
     "follow_default": True,      # 录音中默认输出切换时自动跟随续录
+    # 2026-10-25（用户拍板）：有应用在放声就按应用录（进程回环，绕过系统音量）。
+    # 设备回环采的是"音量之后"的混音，系统音量低会录出 -40dBFS 的小声文件；
+    # 进程回环取音量之前的信号，静音也能录。关掉则回到"录整个系统混音"。
+    "record_by_app": True,
+    # 录音端自动增益：音量很小（如系统音量 5%）时最多放大 32 倍再存盘
+    # （2026-10-26 定档：峰值 0.71 / 上限 32× / 软限幅，实测 RMS -40.7 → -14.0 dBFS）
+    "record_auto_gain": True,
+    # 人声增强（线性相位 FIR，1kHz 归 0dB 只改音色）：off / mild / strong。
+    #   mild   = 2.8kHz +2.1dB、200Hz -2.9dB（自然）
+    #   strong = 2.8kHz +3.4dB、200Hz -3.9dB（更清晰，2026-10-26 用户 A/B 后定档）
+    # 三档在设置里可选；1kHz 归 0dB 保证不改变整体响度（响度归「录音自动增益」管）。
+    "record_voice_boost": "strong",
     "tray": True,                # 关闭窗口时最小化到系统托盘
     # ---- 面板外观 ----
     "panel_opacity": 0.80,       # 整个面板的不透明度（1.0=完全实心）。
@@ -49,6 +61,11 @@ DEFAULTS = {
                                    # 1.0s 过滤句中停顿、保留自然句间停顿。
     "subtitle_ep_min_chars": 6,    # 1~20：端点触发时的最小字数门槛——不够这么多字就不
                                    # 定版，残句（"嗯""这个"）攒进下一句。
+    "subtitle_min_line_chars": 100,  # 0~300：**换行的最小字数**（2026-10-24 用户要求）。
+                                   # 一行攒够这么多字才允许换行——端点/能量门/字数兜底
+                                   # 在未达门槛时都不放行（只对 stream 模式；dual 模式
+                                   # 无流式文本，按音频时长兜底）。0 = 不限（老行为）。
+                                   # 停止字幕时会强制把不足门槛的尾段也上屏，不丢字。
     "subtitle_max_chars": 500,   # 200~2000：定版文本达到该字数强制收尾；0 = 不限。
                                  # 放音乐/噪声时能量门永远不触发"静音"，没有这个兜底
                                  # 段落会无限变长（字幕一行几千字卡死窗口）。
@@ -60,17 +77,36 @@ DEFAULTS = {
     "subtitle_font_size": 15,
     "subtitle_opacity": 0.80,    # 与主面板一致
     "asr_model_dir": "",         # SenseVoice 模型目录；空 = 复用 AI 面试软件那份
+    # ---- GPU 加速（2026-10-24 用户要求③：CUDA 版 sherpa-onnx 上 RTX 4060）----
+    # 决策（2026-10-24 用户拍板 + 全量实测背书，详见 AI语音摘要_任务交接.md §9.6）：
+    #   摘要走 GPU、字幕走 CPU；以后 assistant 做本地转写也按此口径自行决策。
+    # auto  = 探测到 CUDA 运行时（nvidia-*-cu12 pip 包）就用 cuda，否则 cpu；
+    # cuda  = 强制 GPU（运行时缺失会静默回退 CPU，见 startup.log 的 provider 行）；
+    # cpu   = 强制 CPU。管摘要的 SenseVoice 离线识别（用户摘要对象 ≥30 分钟长语音，
+    #        GPU 实测快 5~8 倍且能耗省 3~8 倍；但短句逐条调用 GPU 反而慢 2.6x，
+    #        所以这项只服务"整段一次解码"的摘要场景）。
+    "asr_provider": "auto",
+    # 摘要转写模型（2026-10-26）：paraformer（Paraformer-Large，默认）/ sensevoice（旧模型）
+    # 实测 2 倍速素材：paraformer 准确率 76.5% vs sensevoice 21.2%
+    "asr_model": "paraformer",
+    # 摘要提示词的两个变量（2026-10-26 优化）：留空 = 用 llm.py 里的默认值
+    #  （"录音主人本人 / 30 秒抓住要点、找待办与争议"）
+    "summary_reader": "",
+    "summary_purpose": "",
+    # 字幕轨 provider（流式 Paraformer + dual 模式定版用的 SenseVoice 共用）：
+    # 2026-10-25 实测——流式上 GPU 慢 2.8x（0.1s 小块 kernel 启动开销）；定版是
+    # 2~8s 短音频，GPU 也慢 2.6x（109ms vs 42ms）且多占 300MB（620 vs 317）。
+    # 所以两条字幕轨都默认 cpu；摘要的整段解码才用 asr_provider（默认 auto→cuda）。
+    "subtitle_provider": "cpu",
     "subtitle_capture_exclude": True,  # 不在录屏/屏幕共享里出现
     "subtitle_x": -1,            # 上次位置（-1 = 贴屏幕底部居中）
     "subtitle_y": -1,
-    # ---- 自动转写 / 自动摘要 ----
-    # 2026-10-23 用户选择 Q7=B：录音停止后**只保存录音**，转写/摘要改手动触发
-    # （面板「开始 AI 摘要」卡片仍可对最近一份转写稿生成摘要）。
-    # 想恢复"停止即自动转写+摘要"，在设置里把这两项重新勾上即可。
-    "auto_transcribe": False,     # 录音时后台自动转文字（不弹字幕窗），文稿落盘到 transcript_dir
-    "auto_summary": False,        # 停止录音后自动把转写稿交给 LLM 生成摘要
-    "transcript_dir": "",         # 空 = 默认 <工具目录>\转写
+    # ---- 摘要（2026-10-24 用户要求三功能彻底解耦：录音只录音、字幕只字幕、摘要只摘要）----
+    # 两个旧开关已删：auto_transcribe / auto_summary。
+    # 摘要需要文字时自己做：读本次录音文件 → 本地 SenseVoice 转写 → 落摘要缓存 → 交 LLM。
     "summary_dir": "",            # 空 = 默认 <工具目录>\摘要
+    "summary_cache_dir": "",      # 空 = 默认 <工具目录>\摘要\摘要缓存（转写缓存，供复用/翻查）
+    "summary_cache_keep_days": 7, # 3~90：摘要缓存保留天数，过期自动清理（用户 Q4=7 天）
     "summary_chunk_chars": 6000,  # 超长转写稿分段摘要的阈值（字）；0 = 不分段
     "summary_segment_minutes": 20,  # 摘要按时段分段（分钟/段）；0 = 按字数分（上一项）
     # ---- LLM 摘要：多 profile（2026-10-23 用户需求：保存多个 LLM 随心切换）----
@@ -89,12 +125,12 @@ def default_output_dir() -> str:
     return os.path.join(APP_DIR, "录音")
 
 
-def default_transcript_dir() -> str:
-    return os.path.join(APP_DIR, "转写")
-
-
 def default_summary_dir() -> str:
     return os.path.join(APP_DIR, "摘要")
+
+
+def default_summary_cache_dir() -> str:
+    return os.path.join(APP_DIR, "摘要", "摘要缓存")
 
 
 def _migrate_llm(data: dict, cfg: dict) -> None:

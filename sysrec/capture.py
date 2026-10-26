@@ -17,6 +17,21 @@ import pyaudiowpatch as pyaudio
 import numpy as np
 
 
+def make_capture(device_index: int, on_audio, on_error=None, process_pid: int = 0,
+                 name: str = ""):
+    """按模式造采集器（2026-10-24 新增进程级捕获）。
+
+    process_pid > 0 → WASAPI process loopback（**无视系统静音/音量**，只采该进程）；
+    否则 → 设备回环（采端点混音，系统静音时无信号）。
+    两者接口一致（start/stop/on_audio/sample_rate/channels/name），上层无感。
+    """
+    if process_pid:
+        from .process_loopback import ProcessLoopbackCapture
+        return ProcessLoopbackCapture(int(process_pid), on_audio,
+                                      on_error=on_error, name=name)
+    return LoopbackCapture(device_index, on_audio, on_error=on_error)
+
+
 class LoopbackCapture:
     def __init__(self, device_index: int, on_audio, on_error=None,
                  frames_per_buffer: int = 4096):

@@ -11,8 +11,10 @@ import inspect
 import math
 import os
 import re
+import time
 import shutil
 import threading
+
 
 from PyQt6.QtCore import QDateTime, QPoint, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QCursor, QIcon, QLinearGradient, QPainter, QPen
@@ -29,7 +31,6 @@ from .recorder import Recorder, RecorderConfig
 from .panel import AiPanel
 from .settings_dialog import SettingsDialog
 from .subtitle import SubtitleEngine
-from .transcript import Transcript
 from .subtitle_window import SubtitleWindow
 
 FORMATS = [
@@ -84,6 +85,8 @@ QComboBox QAbstractItemView::item:hover {
 """
 
 
+
+
 def _dbfs(x: float) -> float:
     return 20.0 * math.log10(x) if x > 1e-9 else -120.0
 
@@ -91,6 +94,138 @@ def _dbfs(x: float) -> float:
 def _fmt_hms(seconds: float) -> str:
     s = int(seconds)
     return "%02d:%02d:%02d" % (s // 3600, (s % 3600) // 60, s % 60)
+
+
+#: 句末标点切分（预编译：_paragraphs 每次摘要都会调用）
+_SENT_SPLIT_RE = re.compile("(?<=[。！？；!?;])")
+#: 标题首行 "# xxx"
+_MD_TITLE_RE = re.compile(r"^#+\s*(.+)$")
+#: 去掉尾部的"（时间）"
+_TITLE_TS_RE = re.compile(r"[（(]\d{4}-\d{2}-\d{2}[^)）]*[)）]\s*$")
+
+
+def _paragraphs(text: str, max_chars: int = 170) -> str:
+    """转写稿按句末标点切句、再聚成段落（2026-10-26）。
+
+    SenseVoice 吐出来的几乎只有逗号，一整篇连成一堵墙；标点模型补上句号后，
+    这里按「句号/问号/叹号/分号」切句，攒够 ~170 字成一段，段落间空一行
+    （170 是对齐云端 ASR 的分段粒度：云端同素材 25 段、平均 174 字/段）。
+    纯字符串处理，不加载任何模型；异常或没有句末标点时原样返回。
+    """
+    try:
+        t = (text or "").strip()
+        if not t:
+            return text
+        sents = [s.strip() for s in _SENT_SPLIT_RE.split(t) if s.strip()]
+        if len(sents) <= 1:
+            return text                      # 没有句末标点 → 分段没意义
+        paras, cur = [], ""
+        for s in sents:
+            cur += s
+            if len(cur) >= max_chars:
+                paras.append(cur)
+                cur = ""
+        if cur:
+            paras.append(cur)
+        return "\n\n".join(paras) if paras else text
+    except Exception:                         # noqa: BLE001
+        return text
+
+
+def electron_safe_env() -> dict:
+    """剔除会破坏 Electron 应用启动的环境变量（2026-10-26 实测根因）。
+
+    `ELECTRON_RUN_AS_NODE=1` 会让 Electron **以纯 Node.js 模式运行**：不创建
+    窗口、main 脚本跑完即退出，进程返回码 1 —— 外部表现就是"点了 Typora
+    没反应 / 一闪就没"。若本进程是从带该变量的环境（如某些 IDE / 终端 /
+    自动化沙箱）启动的，它再拉起 Typora 也会继承该变量而失败。
+    所以启动外部程序时统一用这份净化过的环境。
+    """
+    bad = ("ELECTRON_RUN_AS_NODE", "NODE_OPTIONS", "NODE_EXTRA_CA_CERTS")
+    try:
+        return {k: v for k, v in os.environ.items() if k.upper() not in bad}
+    except Exception:                       # noqa: BLE001
+        return dict(os.environ)
+
+
+def focus_window_by_title(hint: str, timeout: float = 8.0) -> bool:
+    """把"标题含 hint"的可见窗口提到前台（2026-10-26）。
+
+    为什么需要：面板常驻置顶（WindowStaysOnTopHint）+ Typora 冷启动 2~4 秒，
+    只靠"临时取消置顶"仍会出现"程序起来了却被面板挡住"。这里在后台轮询最多
+    timeout 秒，找到就 SW_RESTORE + SetForegroundWindow。返回是否成功（供自测）。
+    """
+    if not hint:
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        EnumProc = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+        found = []
+
+        def _cb(hwnd, _lparam):
+            if user32.IsWindowVisible(hwnd):
+                n = user32.GetWindowTextLengthW(hwnd)
+                if n:
+                    buf = ctypes.create_unicode_buffer(n + 1)
+                    user32.GetWindowTextW(hwnd, buf, n + 1)
+                    if hint in buf.value:
+                        found.append(hwnd)
+            return True
+
+        deadline = time.time() + float(timeout)
+        while time.time() < deadline:
+            del found[:]
+            user32.EnumWindows(EnumProc(_cb), 0)
+            if found:
+                hwnd = found[0]
+                user32.ShowWindow(hwnd, 9)            # SW_RESTORE
+                user32.SetForegroundWindow(hwnd)
+                return True
+            time.sleep(0.4)
+    except Exception:                                 # noqa: BLE001
+        return False
+    return False
+
+
+
+
+def _fallback_title(text: str) -> str:
+    """LLM 起名失败时的兜底标题（2026-10-26）。
+
+    取正文第一句（截断到 20 字、去掉标点）——比"未命名"有意义得多，
+    用户能从文件名看出这是哪段录音/哪期视频。
+    """
+    t = (text or "").strip()
+    if not t:
+        return ""
+    first = t.split(chr(10))[0]
+    first = re.split("[。！？!?]", first, maxsplit=1)[0]
+    first = re.sub("[^0-9A-Za-z\u4e00-\u9fff]", "", first)
+    return first[:20]
+
+
+def _voice_boost_mode(v) -> str:
+    """配置里的人声增强档位 → RecorderConfig.voice_boost。
+
+    2026-10-26：从布尔改成三选一字符串（off/mild/strong）。
+    旧配置是 True/False，这里兼容一次（True → strong，即当时定档的档位）。
+    """
+    if isinstance(v, bool):
+        return "strong" if v else "off"
+    s = str(v or "").strip().lower()
+    return s if s in ("off", "mild", "strong") else "off"
+
+
+def _read_audio_files(files):
+    """（兼容保留）读音频 → (16k mono, 秒)。实现已挪到 `asr.read_audio_files`。
+
+    2026-10-25：摘要转写改到子进程后，主进程只用 `probe_audio_seconds` 读时长；
+    这个函数保留给旧调用方/自测脚本，不再有第二份实现。
+    """
+    from .asr import read_audio_files
+    return read_audio_files(files)
 
 
 def _send_to_recycle_bin(path: str) -> None:
@@ -166,72 +301,15 @@ def _guard_qt_callback(fn):
     return wrapper
 
 
-class LevelMeter(QWidget):
-    """实时电平表：RMS 渐变色条 + Peak 白刻度（-60..0 dBFS 映射 0..100%）。
-
-    空闲（未录音）时显示用途提示文字，录音中显示动态电平。
-    """
-
-    def __init__(self):
-        super().__init__()
-        self.setMinimumHeight(26)
-        self.setMaximumHeight(26)
-        self._rms = -120.0
-        self._peak = -120.0
-        self._idle = True
-
-    def set_active(self, active: bool) -> None:
-        """录音状态切换：空闲时显示提示文字，录音时显示动态电平。"""
-        self._idle = not active
-        if not active:
-            self._rms = self._peak = -120.0
-        self.update()
-
-    def set_levels(self, rms_dbfs: float, peak_dbfs: float) -> None:
-        self._rms = rms_dbfs
-        self._peak = peak_dbfs
-        self.update()
-
-    @staticmethod
-    def _pct(db: float) -> float:
-        return max(0.0, min(100.0, (db + 60.0) / 60.0 * 100.0))
-
-    def paintEvent(self, ev):  # noqa: N802
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        w, h = self.width(), self.height()
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor("#1E2129"))
-        p.drawRoundedRect(0, 0, w, h, 6, 6)
-        if self._idle:
-            # 空闲态：显示用途提示（消除"这条黑块是什么"的困惑——2026-10-16 用户反馈）
-            p.setPen(QColor("#8E97A6"))
-            f = p.font()
-            f.setPixelSize(11)
-            p.setFont(f)
-            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "实时电平 · 录音时显示")
-            p.end()
-            return
-        rms_w = int(w * self._pct(self._rms) / 100.0)
-        if rms_w > 0:
-            g = QLinearGradient(0, 0, w, 0)
-            g.setColorAt(0.0, QColor("#3FBF6B"))
-            g.setColorAt(0.65, QColor("#E8C86A"))
-            g.setColorAt(1.0, QColor("#E0563F"))
-            p.setBrush(g)
-            p.drawRoundedRect(0, 0, max(rms_w, 8), h, 6, 6)
-        pk_x = int(w * self._pct(self._peak) / 100.0)
-        if pk_x > 0:
-            p.setPen(QPen(QColor("#F2F2F2"), 2))
-            p.drawLine(min(pk_x, w - 2), 3, min(pk_x, w - 2), h - 3)
-        p.end()
-
-
 class MainWindow(QMainWindow):
     sig_event = pyqtSignal(str, object)
     sig_summary_ok = pyqtSignal(str, str)      # LLM 摘要完成：(path, text)
     sig_summary_fail = pyqtSignal(str)         # LLM 摘要失败：(msg,)
-    sig_summary_step = pyqtSignal(str)         # 摘要进度（分段提炼 x/y…）
+    sig_summary_step = pyqtSignal(str)         # 摘要进度（转写/分段提炼 x/y…）
+    sig_transcribe_ok = pyqtSignal(str, str, str)   # 现场转写完成：(text, title, src)
+    sig_transcribe_fail = pyqtSignal(str)           # 现场转写失败：(msg,)
+    sig_warm_done = pyqtSignal()                    # 启动预热完成 → 主线程挂释放定时器
+    sig_opened_file = pyqtSignal(str)               # 文件已交由某程序启动 → 主线程做窗口调度
 
     def __init__(self, ipc_server=None, logger=None):
         super().__init__()
@@ -241,17 +319,25 @@ class MainWindow(QMainWindow):
         self.rec = None
         self._recording = False
         self.tray_ok = QSystemTrayIcon.isSystemTrayAvailable()
-        # 实时转文字（字幕窗只是"显示"；转写稿落盘另有一套，见 transcript.py）
+        # 实时转文字（字幕窗只是"显示"；不落稿、不摘要——2026-10-24 三功能解耦）
         self._sub_on = False
         self._sub_auto = False             # True = 录音时自动开的（不弹字幕窗）
         self.sub_engine = None
-        # 转写稿 / 摘要
-        self.transcript = None             # 当前这次录音的 Transcript
-        self._last_transcript_path = ""    # 本次会话最后一份落盘的转写稿（摘要素材用，
-                                           # 不用目录里"最新"的旧稿，见 _on_panel_summary）
+        # 摘要（2026-10-24 三功能解耦：摘要自己搞定文字，不再依赖"转写稿"）
+        self._last_files = []              # 最近一次停止录音保存的文件（仅本次会话；
+                                           # 从未录过音的裸窗口也必须存在——曾因漏初始化
+                                           # 导致"点摘要就 AttributeError"，见 2026-10-24 修复）
+        self._sum_cache = None             # (files_tuple, text, title) 本次录音的转写缓存（内存）
+        self._sum_asr = None               # 现场转写用的 Asr（仅降级路径用；闲置 3 分钟释放）
+        self._asr_cli = None               # 摘要转写子进程客户端（2026-10-25 方案 B）
+        self._sum_asr_timer = None         # 闲置释放定时器（主线程）
+        self._trans_busy = False           # 现场转写进行中
         self._summary_busy = False
         self._summary_auto = False         # True = 自动跑的摘要（完成后不弹模态框）
-        self._last_summary_path = ""
+        # 2026-10-26：摘要持久化——启动就扫描摘要目录里最新的 .md，
+        # 这样重启后点「打开摘要」也能打开上一轮的结果（以前只存在内存里，
+        # 重启即丢，才出现"还没有生成过摘要"的红字提示）。
+        self._last_summary_path = self._scan_last_summary()
         self.sub_win = None
 
         # 2026-10-18：主界面换成「AI 摘记面板」——深色无边框置顶浮层
@@ -264,14 +350,19 @@ class MainWindow(QMainWindow):
         self.setStyleSheet("QMainWindow{background:transparent;border:none;}")
 
         self.sig_event.connect(self._on_rec_event)
+        self.sig_opened_file.connect(self._on_file_opened)
         self.sig_summary_ok.connect(self._summary_done)
         self.sig_summary_fail.connect(self._on_summary_fail)
         self.sig_summary_step.connect(self._summary_step)
+        self.sig_transcribe_ok.connect(self._on_transcribe_ok)
+        self.sig_transcribe_fail.connect(self._on_transcribe_fail)
+        self.sig_warm_done.connect(self._arm_sum_asr_release)
         self._timer = QTimer(self)
         self._timer.setInterval(100)
         self._timer.timeout.connect(self._tick)
 
         self._build_ui()
+        self._panel.sig_files_dropped.connect(self._on_files_dropped)   # 拖文件=手动摘要
         self._build_tray()
         self._refresh_devices()
         self._set_status("就绪：点“开始录音”，录制电脑正在播放的声音。")
@@ -281,6 +372,9 @@ class MainWindow(QMainWindow):
             self._ipc_server.newConnection.connect(self._on_ipc_connection)
             if self._ipc_server.hasPendingConnections():
                 QTimer.singleShot(0, self._on_ipc_connection)
+
+        # 启动预热已移除（2026-10-25 用户方案 A+B）：不再在开机时加载模型，
+        # 改为"停止录音后"预热子进程（见 _stop_rec），主进程始终 ~72MB。
 
     # ---------------- UI ----------------
 
@@ -436,75 +530,235 @@ class MainWindow(QMainWindow):
     # ---------------- 数据 / 状态 ----------------
 
     def _out_dir(self) -> str:
-        return self.cfg.get("output_dir") or config_mod.default_output_dir()
+        """录音目录。2026-10-25：绝不落在测试目录里。
 
-    def _transcript_dir(self) -> str:
-        return self.cfg.get("transcript_dir") or config_mod.default_transcript_dir()
+        历史教训（两次）：config 的 output_dir 被指到 `dev\\_test_output`，
+        用户录完音在「录音」里找不到文件（以为丢了）。这里做兜底：
+        只要路径里带 `dev\\` 或 `_test`，一律改回默认「录音」目录并记日志。
+        """
+        d = self.cfg.get("output_dir") or config_mod.default_output_dir()
+        low = str(d).replace("/", "\\").lower()
+        if "\\dev\\" in low or "_test" in low:
+            try:
+                self._logger and self._logger(
+                    "output_dir 指向测试目录（%s），已强制改用默认「录音」目录" % d)
+            except Exception:                    # noqa: BLE001
+                pass
+            return config_mod.default_output_dir()
+        return d
 
     def _summary_dir(self) -> str:
         return self.cfg.get("summary_dir") or config_mod.default_summary_dir()
 
-    # ---------------- 转写稿（后台记录）----------------
+    def _summary_cache_dir(self) -> str:
+        return self.cfg.get("summary_cache_dir") or config_mod.default_summary_cache_dir()
 
-    def _begin_transcript(self) -> None:
-        """开一份新的转写稿（落盘）。上一次的没关就先关掉。"""
-        self._finish_transcript()
-        try:
-            t = Transcript()
-            path = Transcript.new_path(self._transcript_dir())
-            dev = ""
-            try:
-                dev = self.combo_device.currentText() if self.combo_device.count() else ""
-            except Exception:                     # noqa: BLE001
-                dev = ""
-            t.open(path, title=("设备：%s" % dev) if dev else "")
-            self.transcript = t
-        except Exception as e:                    # noqa: BLE001
-            self.transcript = None
-            self._set_status("转写稿无法落盘：%s（录音照常）" % e, warn=True)
+    # ---------------- 摘要素材：现场转写（2026-10-24 三功能解耦）----------------
 
-    def _finish_transcript(self) -> str:
-        """收尾转写稿，返回全文（给摘要用）。没有则返回 ""。"""
-        t = self.transcript
-        self.transcript = None
-        if t is None:
-            return ""
-        try:
-            info = t.close()
-        except Exception:                         # noqa: BLE001
-            return ""
-        if not info.get("lines"):                 # 一句话都没转出来 → 别留个只有头的空文件
+    def _summary_source(self):
+        """摘要素材来源判定（摘要自己搞定文字，不依赖任何"转写稿"产物）。
+
+        返回 (kind, payload)：
+          ("subtitle", 文本)  字幕窗开着且有内容 → 直接摘要（字幕只做字幕，
+                               内容活在窗里，关窗即弃；这里只是"借用"当前内容）
+          ("audio", [文件])   本次刚停止的录音文件 → 调用方走现场转写
+          ("none", None)      都没有 → 引导用户先录音
+        """
+        if self._sub_on and self.sub_win is not None:
             try:
-                os.remove(info.get("path") or "")
-            except Exception:                     # noqa: BLE001
+                lines = self.sub_win.lines()
+            except Exception:                    # noqa: BLE001
+                lines = []
+            if lines:
+                return "subtitle", "\n".join(lines)
+        if self._last_files:
+            return "audio", list(self._last_files)
+        return "none", None
+
+    def _warm_summary_asr_async(self, delay_s: float = 1.0) -> None:
+        """停止录音后预热摘要转写（2026-10-25 用户方案 A+B）。
+
+        不再在启动时加载：开机空闲只占 ~72MB（原方案启动 3 秒就把模型拉起来，
+        常驻 683MB）。现在改为**录完音**再预热，且预热发生在**子进程**里
+        （`AsrClient`）——主进程永不加载 sherpa/CUDA，转写完子进程退出即全部归还。
+        3 分钟不摘要由 _arm_sum_asr_release 杀掉子进程。
+        """
+        def _work():
+            threading.Event().wait(max(0.0, delay_s))   # 让保存提示先出来
+            try:
+                self._asr_client().warm()
+                self.sig_warm_done.emit()               # → 主线程挂释放定时器
+            except Exception:                  # noqa: BLE001  预热失败不致命
                 pass
-            self._last_transcript_path = ""      # 本次没内容 → 不留给摘要当素材
-            return ""
-        self._last_transcript_path = info.get("path") or ""   # 本次会话刚落盘的稿
-        try:
-            return t.text()
-        except Exception:                         # noqa: BLE001
-            return ""
 
-    def _start_transcribe_bg(self) -> bool:
-        """录音时后台自动转文字：引擎照常跑，但**不弹字幕窗**。"""
-        if self._sub_on and self.sub_engine is not None:
-            return True                           # 用户已经开着字幕了，直接复用
-        eng = SubtitleEngine(self.combo_device.currentData(), self.cfg)
-        eng.line.connect(self._on_sub_line)
-        eng.partial.connect(self._on_sub_partial)
-        eng.status.connect(lambda t: self._set_status(t, toast=False))
-        eng.failed.connect(self._on_sub_failed)
-        self.sub_engine = eng
-        if not eng.start():
-            self.sub_engine = None
-            return False
-        self._sub_on = True
-        self._sub_auto = True
-        self.btn_sub.setChecked(True)
-        self.btn_sub.setText("关闭实时字幕")
-        self._panel.set_card_state("subtitle", "active")
-        return True
+        threading.Thread(target=_work, daemon=True,
+                         name="sum-asr-warmup").start()
+
+    def _asr_client(self):
+        """摘要转写子进程客户端（懒建）。"""
+        if self._asr_cli is None:
+            from .asr_client import AsrClient
+            self._asr_cli = AsrClient(
+                model_type=str(self.cfg.get("asr_model") or "paraformer"),
+                provider=self.cfg.get("asr_provider", "auto"),
+                model_dir=self.cfg.get("asr_model_dir") or "")
+        return self._asr_cli
+
+    def _summary_asr(self):
+        """现场转写用的 Asr（懒建 + 复用；主线程 _arm_sum_asr_release 负责定时释放）。
+
+        实测：模型冷加载 228MB 约 30 秒（首次），热缓存下 60 秒音频只需 ~4 秒。
+        复用可让连续摘要秒开；闲置 3 分钟由主线程释放，内存不常驻。
+        """
+        if self._sum_asr is None:
+            from .asr import Asr
+            self._sum_asr = Asr(model_dir=self.cfg.get("asr_model_dir") or None,
+                                model_type=str(self.cfg.get("asr_model") or "paraformer"),
+                                provider=self.cfg.get("asr_provider", "auto"))
+        return self._sum_asr
+
+    def _arm_sum_asr_release(self, delay_ms: int = 180000) -> None:
+        """主线程调用：delay_ms 后释放摘要用的 Asr（释放 ~300MB 内存）。"""
+        try:
+            if getattr(self, "_sum_asr_timer", None) is None:
+                self._sum_asr_timer = QTimer(self)
+                self._sum_asr_timer.setSingleShot(True)
+                self._sum_asr_timer.timeout.connect(self._release_sum_asr)
+            self._sum_asr_timer.start(max(1000, int(delay_ms)))
+        except Exception:                        # noqa: BLE001
+            pass
+
+    def _release_sum_asr(self) -> None:
+        """闲置释放：杀转写子进程（归还全部内存/显存）+ 释放保底用的进程内 Asr。
+
+        2026-10-25：转写/摘要进行中不释放——长音频（30 分钟）转写可能超过
+        3 分钟闲置窗口，定时器到点若正在用就顺延，避免把干活中的子进程杀掉。
+        """
+        if getattr(self, "_trans_busy", False) or getattr(self, "_summary_busy", False):
+            self._arm_sum_asr_release()
+            return
+        try:
+            if getattr(self, "_sum_asr_timer", None) is not None:
+                self._sum_asr_timer.stop()       # 已释放，别再触发
+        except Exception:                        # noqa: BLE001
+            pass
+        cli = getattr(self, "_asr_cli", None)
+        if cli is not None:
+            self._asr_cli = None
+            # 异步停子进程（stop 里最多 wait 2s，别卡 GUI 线程）
+            threading.Thread(target=cli.stop, daemon=True,
+                             name="asr-cli-stop").start()
+        if self._sum_asr is not None:
+            self._sum_asr = None
+            try:
+                import gc
+                gc.collect()                     # 让 sherpa-onnx session 真正归还
+            except Exception:                    # noqa: BLE001
+                pass
+
+    def _start_transcribe_job(self, files) -> None:
+        """现场转写本次录音（后台线程；卡片 busy + 文案进度）。"""
+        if self._trans_busy:
+            return
+        self._trans_busy = True
+        self._panel.set_card_state("summary", "busy")
+        self._set_status("正在转写本次录音…")
+        # 正在干活：撤掉闲置释放定时器（长音频转写可能超过 3 分钟）
+        try:
+            if getattr(self, "_sum_asr_timer", None) is not None:
+                self._sum_asr_timer.stop()
+        except Exception:                        # noqa: BLE001
+            pass
+        threading.Thread(target=self._transcribe_work, args=(list(files),),
+                         daemon=True).start()
+
+    def _transcribe_work(self, files) -> None:
+        """worker：子进程转写 → LLM 起标题 → 落摘要缓存。
+
+        2026-10-25 方案 B：转写在 `asr_worker` 子进程里做（主进程不加载模型，
+        子进程退出即归还内存/显存）；子进程不可用时回退主进程内转写（仅保底）。
+        """
+        try:
+            from . import naming
+            from .asr import probe_audio_seconds
+            secs = probe_audio_seconds(files)      # 只读元信息，轻量
+            self.sig_summary_step.emit(
+                "正在转写本次录音（音频 %.0f 秒，约需 %.0f 秒；首次需加载模型会慢些）…"
+                % (secs, max(2.0, secs / 8.0)))
+            try:
+                text, _dec, audio_secs = self._asr_client().transcribe(files)
+                if audio_secs:
+                    secs = audio_secs
+            except Exception as e:                   # noqa: BLE001  子进程异常 → 主进程保底
+                self.sig_summary_step.emit("子进程转写不可用（%s），改用主进程转写…"
+                                           % str(e)[:60])
+                from .asr import read_audio_files
+                audio, secs2 = read_audio_files(files)
+                if audio is None or not len(audio):
+                    self.sig_transcribe_fail.emit("读不到本次录音的音频内容")
+                    return
+                secs = secs2
+                text = (self._summary_asr().transcribe(audio, skip_vad=True) or "").strip()
+            text = (text or "").strip()
+            if not text:
+                self.sig_transcribe_fail.emit("本次录音没有识别出文字（可能太短或没人说话）")
+                return
+            # 2026-10-26：转写稿分段（标点由子进程里的标点模型补，这里只切段）。
+            # 落盘的转写稿和送给 LLM 的文本都用分段版，读起来不再是"一堵墙"。
+            text = _paragraphs(text)
+            # 命名：LLM 起标题（失败静默回退"未命名"，用户 Q2/Q10）
+            title = ""
+            try:
+                from .llm import LlmClient, name_title
+                cfg = self._llm_cfg()
+                if cfg:
+                    title = name_title(LlmClient(cfg), text)
+            except Exception:                    # noqa: BLE001
+                title = ""
+            if not title:                        # LLM 失败/未配置 → 首句兜底
+                title = _fallback_title(text)
+            # 落摘要缓存（时间在前，用户 Q1=B）：<时间>_<标题>.md
+            try:
+                cd = self._summary_cache_dir()
+                os.makedirs(cd, exist_ok=True)
+                path = os.path.join(cd, naming.cache_filename(title))
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("# %s\n\n> 来源音频：%s\n> 转写时间：%s\n> 字数：%d\n\n%s\n"
+                            % (title or "未命名", os.path.basename(files[0]),
+                               QDateTime.currentDateTime().toString("yyyy-MM-dd hh:mm:ss"),
+                               len(text), text))
+                self._cleanup_summary_cache()    # 用户 Q4：保留 N 天后自动清理
+            except Exception:                    # noqa: BLE001  缓存落盘失败不影响摘要
+                pass
+            self.sig_transcribe_ok.emit(text, title, os.path.basename(files[0]))
+        except Exception as e:                   # noqa: BLE001
+            self.sig_transcribe_fail.emit("转写失败：%s" % e)
+
+    def _on_transcribe_ok(self, text: str, title: str, src: str) -> None:
+        self._trans_busy = False
+        self._sum_cache = (tuple(self._last_files or ()), text, title)
+        # 2026-10-25：转写拿到文字后 worker 就没用了（后续摘要走缓存文本，
+        # 不再需要 ASR）——立刻让它退出，别挂着 1.1GB 等 3 分钟。
+        self._release_sum_asr()
+        self._panel.toast("转写完成（%d 字），正在生成摘要…" % len(text), 4000)
+        self._start_summary(text, auto=False, src=src, title=title)
+
+    def _on_transcribe_fail(self, msg: str) -> None:
+        self._trans_busy = False
+        self._release_sum_asr()                  # 失败也不必留着 worker
+        self._panel.set_card_state("summary", "idle")
+        # 2026-10-25 用户要求：转写失败（如"没识别出文字"）也要给三个动作按钮，
+        # 方便直接去看录音/摘要/转写目录排查。
+        self._show_folder_actions(msg, warn=True)
+
+    def _cleanup_summary_cache(self) -> None:
+        """摘要缓存按"保留天数"清理过期文件（用户 Q4=7 天，可设置）。"""
+        try:
+            from . import naming
+            naming.cleanup_cache(self._summary_cache_dir(),
+                                 int(self.cfg.get("summary_cache_keep_days", 7) or 7))
+        except Exception:                        # noqa: BLE001
+            pass
 
     def _update_dir_label(self) -> None:
         d = self._out_dir()
@@ -600,6 +854,8 @@ class MainWindow(QMainWindow):
     @_guard_qt_callback
     def _open_settings(self) -> None:
         dlg = SettingsDialog(self.cfg, self)
+        # 2026-10-25 方案①：「保存模型」落盘后立即同步进运行内存（不用等全局保存）
+        dlg.sig_llm_saved.connect(self._on_llm_saved)
         if dlg.exec() != QDialog.DialogCode.Accepted or not dlg.result_cfg:
             return
         new_cfg = dlg.result_cfg
@@ -616,6 +872,22 @@ class MainWindow(QMainWindow):
             self._stop_subtitle()
             self._drop_sub_win()
             self._toggle_subtitle(True)
+
+    @_guard_qt_callback
+    def _on_llm_saved(self, new_cfg: dict) -> None:
+        """「保存模型」即时生效（2026-10-25 方案①）。
+
+        设置对话框的「保存模型」已立即落盘 config.json；这里只把 LLM 相关键同步进
+        运行内存——**不全量 update**，避免冲掉设置里改到一半的其他项。
+        摘要链路每次现读 self.cfg（_llm_cfg）→ 下一次摘要就是用新配置。
+        """
+        if not isinstance(new_cfg, dict):
+            return
+        for k in ("llm_profiles", "llm_active"):
+            if k in new_cfg:
+                self.cfg[k] = new_cfg[k]
+        self._set_status("LLM 配置已保存并生效（当前模型：%s）"
+                         % (self.cfg.get("llm_active") or "（未选）"))
 
     @_guard_qt_callback
     def _toggle_subtitle(self, on=None) -> None:
@@ -637,7 +909,8 @@ class MainWindow(QMainWindow):
         win.raise_()
         win.apply_capture_exclude(bool(self.cfg.get("subtitle_capture_exclude", True)))
 
-        eng = SubtitleEngine(self.combo_device.currentData(), self.cfg)
+        _spid, _spname, _smuted = self._pick_capture_target()
+        eng = SubtitleEngine(self.combo_device.currentData(), self.cfg, process_pid=_spid)
         eng.line.connect(self._on_sub_line)
         eng.partial.connect(self._on_sub_partial)
         eng.status.connect(lambda t: self._set_status(t, toast=False))
@@ -654,15 +927,16 @@ class MainWindow(QMainWindow):
         self.btn_sub.setChecked(True)     # 程序内调用（如改完设置自动重启）时也要同步高亮
         self.btn_sub.setText("关闭实时字幕")
         self._panel.set_card_state("subtitle", "active")   # 卡片：字幕已开启
+        if _spid:
+            self._panel.toast("系统静音 → 字幕按进程听：%s（无视系统静音）"
+                              % (_spname or "#%d" % _spid), 4500)
+        elif _smuted:
+            self._panel.toast("系统是静音的，且当前没有应用在放声——字幕收不到声音。",
+                              5000, warn=True)
 
     def _stop_subtitle(self) -> None:
-        # 录音还在进行时：字幕窗可以关，但后台转写必须继续——
-        # 否则转写稿从这一刻起断档，停止后生成的摘要会缺后半场。
-        if (self._recording and self.transcript is not None
-                and self.transcript.running and self.sub_engine is not None):
-            if self.sub_win is not None:
-                self.sub_win.hide()
-            return
+        # 2026-10-24 三功能解耦：字幕只负责显示，关字幕即停引擎
+        # （不再有"录音中关窗但后台继续转写落稿"的概念）
         if self.sub_engine is not None:
             try:
                 self.sub_engine.stop()
@@ -695,63 +969,54 @@ class MainWindow(QMainWindow):
         """
         from .llm import active_profile, profile_client_cfg
         prof = active_profile(self.cfg)
-        return profile_client_cfg(prof) if prof else {}
-
-    @_guard_qt_callback
-    def _on_sub_summary(self) -> None:
-        if self.sub_win is None:
-            return
-        lines = self.sub_win.lines()
-        if not lines:
-            self._set_status("还没有字幕可摘要（先开实时转文字、说几句话）", warn=True)
-            return
-        self._start_summary("\n".join(lines), auto=False)
-
-    def _resolve_summary_text(self):
-        """摘要素材解析（2026-10-23 用户方案 B：本次没有稿就取消，绝不拿历史旧稿充数）。
-
-        返回 (text, src, reason)：
-          reason="live"    = 当前会话内存里的转写稿（录音中/刚停止）
-          reason="session" = 本次会话刚落盘的那份（停止时收尾的）
-          reason="none"   = 本次没有任何转写稿 → 调用方取消摘要并引导
-        刻意不用 `_latest_transcript_path()`（目录里文件名最新的稿）——那是
-        别次录音/别天开的字幕留下的历史稿，静默用它就是"摘要内容是上一段音频"
-        bug 的根因（Q7=B 关自动转写后，纯录音永远没有本次稿）。
-        """
-        t = self.transcript
-        if t is not None and len(t):
-            return t.text(), (t.path or ""), "live"
-        p = self._last_transcript_path
-        if p:
-            try:
-                text = Transcript.load(p).text()
-            except Exception:                    # noqa: BLE001  文件被删/损坏 → 当没有
-                text = ""
-            if text.strip():
-                return text, p, "session"
-        return "", "", "none"
+        if not prof:
+            return {}
+        cc = profile_client_cfg(prof)
+        # 2026-10-26：摘要提示词的 {读者}/{用途} 变量（全局配置，留空用默认）
+        cc["summary_reader"] = str(self.cfg.get("summary_reader") or "")
+        cc["summary_purpose"] = str(self.cfg.get("summary_purpose") or "")
+        return cc
 
     @_guard_qt_callback
     def _on_panel_summary(self) -> None:
-        """面板「开始 AI 摘要」：对**本次**转写稿生成纪要（方案 B）。"""
+        """面板「开始 AI 摘要」：摘要自己搞定文字（2026-10-24 三功能解耦）。
+
+        来源优先级：字幕窗当前内容 > 本次刚停止的录音（现场转写）> 无。
+        """
         if self._summary_busy:
             self._panel.toast("摘要正在生成中，请稍候…", 2500)
             return
+        if self._trans_busy:
+            self._panel.toast("正在转写本次录音，转完会自动生成摘要…", 3000)
+            return
         if self._recording:
-            self._panel.toast("录音中——停止并保存后会自动生成摘要。", 3500)
+            self._panel.toast("录音中——停止后可直接点摘要。", 3500)
             return
-        text, src, reason = self._resolve_summary_text()
-        if reason == "none":
-            # B 方案：本次没有转写稿 → 取消本次摘要 + 正确引导（不碰历史旧稿）
-            self._panel.toast(
-                "本次录音没有转写稿（设置里「录音时后台自动转文字」当前是关的）。"
-                "要生成摘要：开启字幕录音，或在设置里把它打开。", 6000, warn=True)
+        kind, payload = self._summary_source()
+        if kind == "none":
+            # 2026-10-25 用户要求：直接点摘要也要给三个动作按钮（不是一条会消失的提示）
+            # 2026-10-26：颜色改为与其他提示一致的白色（warn=False），
+            # 这只是"暂时没内容"的普通提示，不是错误。
+            self._show_folder_actions(
+                "还没有可摘要的内容：先录音（停止后可直接摘要）或开启字幕。")
             return
-        self._panel.toast("正在用 %d 字转写稿生成摘要…" % len(text), 4000)
-        self._start_summary(text, auto=True, src=src)
+        if kind == "subtitle":
+            # 2026-10-26：字幕来源同样没传 title（也会落成「未命名」）——
+            # 用首句兜底，保证文件名能看出内容。
+            self._start_summary(payload, auto=False, src="字幕",
+                                title=_fallback_title(payload))
+            return
+        # kind == "audio"：本次录音 → 有内存缓存就复用，否则现场转写
+        files = payload
+        if self._sum_cache and self._sum_cache[0] == tuple(files):
+            self._start_summary(self._sum_cache[1], auto=False,
+                                src="本次录音（缓存）", title=self._sum_cache[2])
+            return
+        self._start_transcribe_job(files)
 
-    def _start_summary(self, text: str, auto: bool = False, src: str = "") -> None:
-        """统一的摘要入口（自动 / 手动都走这里）。"""
+    def _start_summary(self, text: str, auto: bool = False, src: str = "",
+                       title: str = "") -> None:
+        """统一的摘要入口（手动都走这里；title 用于摘要文件命名）。"""
         text = (text or "").strip()
         if not text:
             self._set_status("转写文本为空，没有可摘要的内容", warn=True)
@@ -784,14 +1049,15 @@ class MainWindow(QMainWindow):
         self._summary_auto = bool(auto)
         self._set_status("正在用「%s」生成摘要（约 10~60 秒）…" % prof["name"])
         self._panel.set_card_state("summary", "busy")     # 卡片：处理中
-        threading.Thread(target=self._summary_work, args=(text, src),
+        threading.Thread(target=self._summary_work, args=(text, src, title),
                          daemon=True).start()
 
     def _summary_step(self, msg: str) -> None:
         self._set_status(msg)
 
-    def _summary_work(self, text: str, src: str = "") -> None:
+    def _summary_work(self, text: str, src: str = "", title: str = "") -> None:
         try:
+            from . import naming
             from .llm import LlmClient, summarize_long
             client = LlmClient(self._llm_cfg())
             chunk = int(self.cfg.get("summary_chunk_chars", 6000) or 0)
@@ -799,30 +1065,383 @@ class MainWindow(QMainWindow):
             out = summarize_long(
                 client, text, chunk_chars=chunk, segment_minutes=seg,
                 progress=lambda m: self.sig_summary_step.emit(m))
+            if not (out or "").strip():
+                # 2026-10-26：模型返回空正文时**不再写空文件**（曾出现只有页脚的
+                # 249 字节"空摘要"）。走失败分支，让用户看到真实原因。
+                self.sig_summary_fail.emit(
+                    "摘要为空：模型没有返回正文（推理模型可能把 token 全用在思考上了，"
+                    "请在设置里调大 max_tokens 或关闭思考模式）。")
+                return
             d = self._summary_dir()
             os.makedirs(d, exist_ok=True)
             now = QDateTime.currentDateTime()
-            path = os.path.join(d, "摘要_%s.md" % now.toString("yyyyMMdd_hhmmss"))
+            # 命名（用户 Q1=B/Q3：与缓存同名口径，时间在前 + 标题 + _摘要）
+            path = os.path.join(d, naming.summary_filename(title))
             with open(path, "w", encoding="utf-8") as f:
-                f.write("# 摘要（%s）\n\n%s\n\n---\n\n## 原始转写（%d 字）\n\n%s\n"
-                        % (now.toString("yyyy-MM-dd hh:mm:ss"), out, len(text), text))
+                # 2026-10-24 用户要求：摘要文件只放摘要，不再附原始转写全文——
+                # 音频来源的转写稿已在「摘要缓存」目录落盘（见 _transcribe_work），
+                # 两份文件各存一份全文只会越滚越大；这里只留一行来源说明。
+                if src == "字幕":
+                    note = "素材来源：字幕窗口（转写 %d 字；字幕内容未落缓存，关窗即弃）" % len(text)
+                else:
+                    note = "素材来源：%s（转写 %d 字；全文见「摘要缓存」目录）" % (
+                        src or "本次录音", len(text))
+                # 2026-10-25 用户要求：素材来源下面再加一行，写明由哪个大模型生成
+                try:
+                    from .llm import active_profile
+                    prof = active_profile(self.cfg) or {}
+                except Exception:                      # noqa: BLE001
+                    prof = {}
+                model_line = "生成模型：%s" % (prof.get("model") or "未配置")
+                if prof.get("name") and prof.get("name") != prof.get("model"):
+                    model_line = "生成模型：%s（%s）" % (prof["name"], prof.get("model") or "未配置")
+                f.write("# 摘要：%s（%s）\n\n%s\n\n> %s\n> %s\n"
+                        % (title or "未命名", now.toString("yyyy-MM-dd hh:mm:ss"),
+                           out, note, model_line))
             self.sig_summary_ok.emit(path, out)      # 跨线程：worker → GUI 主线程
         except Exception as e:  # noqa: BLE001
             self.sig_summary_fail.emit("摘要失败：%s" % e)
+
+    @_guard_qt_callback
+    def _on_file_opened(self, exe: str) -> None:
+        """文件已交由某程序启动（主线程）：只补提示，**不再降置顶**。
+
+        2026-10-26：`_open_path` 已在启动前降过一次；这里再降会叠加第二个
+        8 秒定时器，导致"置顶消失很久"。降置顶只做一次。
+        """
+        if exe and exe.lower().endswith("notepad.exe"):
+            self._panel.toast("已用记事本打开（.md 没有可用的编辑器关联）", 4500)
+
+    _SWP_NOSIZE = 0x0001
+    _SWP_NOMOVE = 0x0002
+    _SWP_NOACTIVATE = 0x0010
+
+    def _set_topmost(self, on: bool) -> bool:
+        """用 Win32 切换面板置顶（2026-10-26）。
+
+        为什么不用 Qt 的 setWindowFlag(WindowStaysOnTopHint)：
+        它会让 Qt **销毁并重建原生窗口**（内部必须 hide+show），表现为窗口
+        "闪一下"；8 秒后恢复时再闪一次，且置顶常来不及生效。
+        HWND_TOPMOST / HWND_NOTOPMOST 只改扩展样式（WS_EX_TOPMOST），
+        不重建、不闪、立即生效。返回是否成功。
+        """
+        try:
+            import ctypes
+            hwnd = int(self._panel.winId())        # 首调用会创建原生窗口
+            if not hwnd:
+                return False
+            flag = -1 if on else -2                # HWND_TOPMOST / HWND_NOTOPMOST
+            ok = ctypes.windll.user32.SetWindowPos(
+                ctypes.c_void_p(hwnd), ctypes.c_void_p(flag), 0, 0, 0, 0,
+                self._SWP_NOMOVE | self._SWP_NOSIZE | self._SWP_NOACTIVATE)
+            return bool(ok)
+        except Exception:                          # noqa: BLE001
+            return False
+
+    def _lower_panel_then_restore(self) -> None:
+        """打开外部窗口前临时取消置顶（2026-10-26）。
+
+        面板是 WindowStaysOnTopHint 常驻置顶，新打开的 Typora / 记事本 /
+        资源管理器都会被它挡住 —— 用户点了"打开摘要"却什么都看不到，以为没反应。
+        这里临时降下来并压到底层，8 秒后恢复（Typora 冷启动要 2~4 秒，
+        1.5 秒就恢复会把刚起来的窗口又盖住 —— 2026-10-26 实测踩到）。
+        """
+        if not self._set_topmost(False):       # Win32：无闪烁
+            try:                               # 兜底：Qt 方式（会闪，但功能正确）
+                self._panel.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, False)
+                self._panel.show()
+            except Exception:                  # noqa: BLE001
+                pass
+        QTimer.singleShot(8000, self._restore_panel_top)
+
+    def _restore_panel_top(self) -> None:
+        if not self._set_topmost(True):        # Win32：无闪烁
+            try:
+                self._panel.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+                self._panel.show()
+            except Exception:                  # noqa: BLE001
+                pass
+        try:
+            self._panel.raise_()
+        except Exception:                      # noqa: BLE001
+            pass
+
+    def _open_path(self, path: str) -> None:
+        """用系统默认应用/资源管理器打开路径（2026-10-25 摘要完成三按钮用）。
+
+        2026-10-26 修"点了没反应"：
+          ① .md 没关联程序时 os.startfile 会弹"选择应用"对话框，而面板置顶
+             把对话框挡住了 → 改用记事本兜底打开；
+          ② 打开前临时取消面板置顶，让新窗口看得见。
+        """
+        try:
+            if os.path.isdir(path):            # 目录 → 资源管理器（2026-10-26）
+                self._open_dir(path)
+                return
+            self._lower_panel_then_restore()   # 先让位（主线程立即生效），再启动程序
+            threading.Thread(target=self._open_path_worker, args=(path,),
+                             daemon=True, name="open-file").start()
+        except Exception as e:  # noqa: BLE001
+            self._set_status("打开失败：%s" % e, warn=True)
+
+    def _open_path_worker(self, path: str) -> None:
+        """后台打开文件：按优先级试，**验活失败就换下一个**（2026-10-26）。
+
+        为什么不能只 Popen 一次：
+          · `HKCR\\.md` 在本机指向 **WorkBuddy**（实测）→ os.startfile 把 md
+            交给 WorkBuddy，用户以为"没反应"；
+          · 本机 **Typora 起不来**（带/不带参数都秒退，返回码 0/1）→ 只 Popen
+            会静默失败，用户还是看不到东西。
+        所以：按 首选列表 → 注册表命令 → 记事本 的顺序逐个尝试；
+        每个都"启动后 1.5 秒验活"（还活着 = 成功；秒退但存在同名进程 = 已转交
+        给已有实例，也算成功），全失败才走 os.startfile 兜底。
+        """
+        import subprocess
+        ext = os.path.splitext(path)[1].lower()
+        candidates = list(self.PREFERRED_OPENERS.get(ext, []))
+        cmd_exe = self._open_command_exe(ext)
+        if cmd_exe:
+            candidates.append(cmd_exe)
+        candidates.append(r"C:\Windows\notepad.exe")
+        for exe in candidates:
+            if not exe or not os.path.isfile(exe):
+                continue
+            try:
+                p = subprocess.Popen([exe, os.path.normpath(path)],
+                                     env=electron_safe_env())
+            except Exception:                          # noqa: BLE001
+                continue
+            time.sleep(1.5)
+            # 验活：进程还在（None）或返回 0 都算成功。
+            # 注意不能用"tasklist 里有同名进程"当成功条件——Typora 这类
+            # 单实例应用会把文件转交给已有实例后**退出**，但本机实测 Typora
+            # 返回码为 1（真起不来），必须据此回退到下一个候选（2026-10-26）。
+            rc = p.poll()
+            if rc is None or rc == 0:
+                # 窗口调度必须回主线程（setWindowFlag/show 跨线程调用不生效，
+                # 2026-10-26 实测：worker 里直接调，降置顶静默失效）
+                self.sig_opened_file.emit(exe)
+                hint = os.path.splitext(os.path.basename(path))[0][:20]
+                focus_window_by_title(hint, 6.0)   # 纯 win32 轮询，线程安全
+                return
+            # rc 非 0 → 这个程序打不开，继续试下一个
+        try:                                           # 最后兜底：交给系统
+            os.startfile(path)  # noqa: S606
+            self.sig_opened_file.emit("os.startfile")
+        except Exception as e:                         # noqa: BLE001
+            self._set_status("打开失败：%s" % e, warn=True)
+
+    def _proc_alive(self, exe_name: str) -> bool:
+        """是否已有同名进程在跑（判断"秒退是转交给已有实例"）。"""
+        try:
+            import subprocess
+            out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq %s" % exe_name,
+                                  "/FO", "CSV", "/NH"], capture_output=True)
+            txt = out.stdout.decode("gbk", errors="replace")
+            return exe_name.lower() in txt.lower()
+        except Exception:                              # noqa: BLE001
+            return False
+
+    #: 各格式的"编辑器"优先级（2026-10-26）。
+    #  为什么需要：`HKCR\.md` 在本机指向 **WorkBuddy**（实测），os.startfile 会把
+    #  md 交给 WorkBuddy，用户以为"没反应"。这里显式优先用真正的编辑器打开。
+    PREFERRED_OPENERS = {
+        ".md": [r"D:\Program Files\Typora\Typora.exe",
+                r"C:\Program Files\Typora\Typora.exe",
+                r"C:\Program Files (x86)\Typora\Typora.exe"],
+        ".txt": [r"C:\Windows\notepad.exe"],
+        ".log": [r"C:\Windows\notepad.exe"],
+    }
+
+    def _pick_opener(self, ext: str) -> str:
+        """选出用于打开该扩展名的程序路径；都不适用则返回 ""（走 os.startfile）。"""
+        for p in self.PREFERRED_OPENERS.get(ext, []):
+            if os.path.isfile(p):
+                return p
+        return self._open_command_exe(ext)
+
+    def _open_command_exe(self, ext: str) -> str:
+        """注册表里声明的打开命令行 → 抽出可执行文件路径（抽不到返回 ""）。"""
+        cmd = self._open_command(ext)
+        if not cmd:
+            return ""
+        s = cmd.replace('"%1"', "").replace("%1", "").strip() \
+               .replace('"', "")
+        # 形如 `D:\Program Files\X\X.exe` 或带参数：取第一段看起来像 exe 的
+        for tok in s.split():
+            if tok.lower().endswith(".exe") and os.path.isfile(tok):
+                if "workbuddy" in tok.lower():
+                    continue    # 宿主程序不是 md 编辑器（2026-10-26 实测：
+                                # HKCR\.md 指向 WorkBuddy.md → 点了"没反应"）
+                return tok
+        if s and os.path.isfile(s):
+            if "workbuddy" not in s.lower():
+                return s
+        return ""
+
+    # ---------------- 手动摘要（2026-10-25 用户要求） ----------------
+    AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".flac", ".ogg", ".opus", ".aac", ".wma"}
+    TEXT_EXTS = {".md", ".txt", ".markdown", ".log"}
+
+    def _manual_summary(self) -> None:
+        """手动摘要：选一个音频（先转写再摘要）或文本（直接摘要）文件。"""
+        audio = " ".join("*%s" % e for e in sorted(self.AUDIO_EXTS))
+        text = " ".join("*%s" % e for e in sorted(self.TEXT_EXTS))
+        path, _sel = QFileDialog.getOpenFileName(
+            self, "手动摘要：选择音频或文本文件", self._out_dir(),
+            "音频/文本 (%s %s);;音频 (%s);;文本 (%s);;所有文件 (*)"
+            % (audio, text, audio, text))
+        if path:
+            self._summarize_path(path)
+
+    def _on_files_dropped(self, paths) -> None:
+        """拖文件进面板（2026-10-25）：一次只处理一个。"""
+        paths = [p for p in (paths or []) if os.path.isfile(p)]
+        if not paths:
+            return
+        if len(paths) > 1:
+            self._panel.toast("一次只能拖一个文件，已用第一个：%s"
+                              % os.path.basename(paths[0]), 4000, warn=True)
+        self._summarize_path(paths[0])
+
+    def _title_from_source(self, path: str, text: str) -> str:
+        """从素材文件推断摘要标题（2026-10-26）。
+
+        【为什么需要】手动摘要（拖/选文件）以前只传 `src=文件名`、**不传 title**，
+        落盘时 `summary_filename("")` 恒为「未命名」——这就是 16:24/16:25 两份
+        文件名是"未命名"的根因（素材其实是带标题的转写稿）。
+        取标题的顺序：
+          ① 内容首行的 Markdown 标题（`# 摘要：xxx（时间）` / `# xxx`）；
+          ② 文件名去掉「时间戳前缀」与「_摘要/_转写/_字幕」后缀。
+        """
+        try:
+            first = (text or "").strip().split(chr(10))[0].strip()
+            m = _MD_TITLE_RE.match(first or "")
+            if m:
+                t = m.group(1).strip()
+                t = re.sub(r"^摘要[：:]\s*", "", t)
+                t = _TITLE_TS_RE.sub("", t)
+                t = t.strip()
+                if t:
+                    return t[:30]
+        except Exception:                      # noqa: BLE001
+            pass
+        try:
+            base = os.path.splitext(os.path.basename(path or ""))[0]
+            base = re.sub(r"^\d{8}-\d{6}_", "", base)      # 去 20261026-160317_
+            base = re.sub(r"(_摘要|_转写|_字幕)$", "", base)  # 去后缀
+            return base.strip()[:30]
+        except Exception:                      # noqa: BLE001
+            return ""
+
+    def _summarize_path(self, path: str) -> None:
+        """按扩展名分流：音频 → 子进程转写后再摘要；文本 → 直接摘要。"""
+        if self._recording:
+            self._panel.toast("录音中——先停止录音，再手动摘要。", 4000, warn=True)
+            return
+        if self._trans_busy or self._summary_busy:
+            self._panel.toast("正在处理上一条，请稍候…", 3000)
+            return
+        ext = os.path.splitext(path)[1].lower()
+        name = os.path.basename(path)
+        if ext in self.AUDIO_EXTS:
+            # 当作"本次素材"：缓存键、来源标注都用它
+            self._last_files = [path]
+            self._set_status("手动摘要：正在转写 %s…" % name)
+            self._start_transcribe_job([path])
+            return
+        if ext in self.TEXT_EXTS:
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    text = f.read()
+            except Exception as e:               # noqa: BLE001
+                self._set_status("读不了这个文本文件：%s" % e, warn=True)
+                return
+            if not text.strip():
+                self._set_status("文本文件是空的：%s" % name, warn=True)
+                return
+            # 2026-10-26：手动摘要以前不传 title → 文件名恒为「未命名」。
+            # 这里从素材首行标题 / 文件名推断，保证摘要文件名有意义。
+            self._start_summary(text, auto=False, src=name,
+                                title=self._title_from_source(path, text))
+            return
+        self._panel.toast("不支持这种文件：%s（要音频或文本）" % (ext or "无扩展名"),
+                          4500, warn=True)
+
+    def _open_dir(self, d: str) -> None:
+        """打开目录（不存在就先建）。三个"打开…"按钮共用。"""
+        try:
+            os.makedirs(d, exist_ok=True)
+            os.startfile(d)  # noqa: S606  Windows 打开资源管理器
+        except Exception as e:  # noqa: BLE001
+            self._set_status("打开目录失败：%s" % e, warn=True)
+
+    def _scan_last_summary(self) -> str:
+        """返回摘要目录里最新的 .md（无则 ""）——摘要持久化的读取端。"""
+        try:
+            import glob
+            d = self._summary_dir()
+            files = glob.glob(os.path.join(d, "*.md"))
+            if not files:
+                return ""
+            files.sort(key=lambda f: os.path.getmtime(f), reverse=True)
+            return files[0]
+        except Exception:                      # noqa: BLE001
+            return ""
+
+    def _open_last_summary(self) -> None:
+        """打开上一轮生成的摘要文件（2026-10-26 用户要求的新按钮）。
+
+        摘要文件路径存在 _last_summary_path（_summary_done 落盘时记录）；
+        没有就提示，不弹窗。打开走 _open_path（Typora 优先 + 回退链）。
+        """
+        p = getattr(self, "_last_summary_path", "")
+        if not p or not os.path.isfile(p):
+            p = self._scan_last_summary()      # 惰性兜底：目录里还有就直接用
+            self._last_summary_path = p
+        if p and os.path.isfile(p):
+            self._open_path(p)
+            return
+        self._panel.toast("还没有生成过摘要——先点摘要或录一段。", 4000, warn=True)
+
+    def _show_folder_actions(self, text: str, warn: bool = False) -> None:
+        """没素材 / 转写失败时，也给三个动作按钮（2026-10-25 用户要求）。
+
+        与"摘要完成"那组同一套 toast_actions：位置/尺寸一致（26px、贴底 6px），
+        高度同样 226 ↔ 186。失败场景没有"摘要文件"可开，所以三个按钮都是目录。
+        注意顺序：先写状态栏（toast=False）——否则 _set_status 的默认 toast 会
+        走 _clear_actions()，把刚建的按钮和加高一起撤掉（2026-10-25 踩过）。
+        """
+        self._set_status(text, warn=warn, toast=False)
+        self._panel.toast_actions(
+            text,
+            [("打开录音", lambda: self._open_dir(self._out_dir())),
+             ("打开摘要", self._open_last_summary),          # 打开上一轮摘要文件
+             ("打开文件夹", lambda: self._open_dir(self._summary_dir())),
+             ("手动摘要", self._manual_summary)],
+            warn=warn)
 
     def _summary_done(self, path: str, out: str) -> None:
         self._summary_busy = False
         self._last_summary_path = path
         self._panel.flash_card("summary", "done", 2000)   # 卡片：刚生成完
         name = os.path.basename(path)
-        if self._summary_auto:
-            # 自动摘要不弹模态框打断人，面板轻提示 + 状态栏
-            self._panel.toast("摘要已生成：%s（在「摘要」目录）" % name, 6000)
-            self._set_status("摘要已生成：%s" % path)
-            return
-        shown = out[:800] + ("\n……（显示已截断）" if len(out) > 800 else "")
-        msgbox.info(self, "摘要已生成",
-                    "%s\n\n完整版与原始字幕已存：\n%s" % (shown, path))
+        # 2026-10-25：状态栏先写（toast=False）——_set_status 默认会弹普通 toast，
+        # 而 toast() 内部 _clear_actions() 会把下面刚建的动作按钮和加高一起撤掉
+        # （实测：按钮出现又瞬间消失、高度弹回 186）。顺序必须是"先状态栏、后按钮"。
+        self._set_status("摘要已生成：%s" % path, toast=False)
+        # 2026-10-25 用户要求：摘要完成后给三个动作按钮——位置/尺寸与"录完音"
+        # 那组完全一致（同一个 toast_actions：贴底 6px、26 高；高度由
+        # _ensure_height(226) / 收起时缩回 186 统一管理，不会再抖）。
+        self._panel.toast_actions(
+            "摘要已生成：%s" % name,
+            [("打开摘要", lambda: self._open_path(path)),
+             # 2026-10-26 修：目录必须走 _open_dir（os.startfile(dir) → 资源管理器）。
+             # 原来用 _open_path 会进入"文件打开器"候选链（Typora→记事本），
+             # 记事本打不开目录 → 表现为"点了不是打开文件夹"。
+             ("打开文件夹",
+              lambda p=path: self._open_dir(os.path.dirname(p) or self._summary_dir())),
+             ("手动摘要", self._manual_summary)])
 
     def _on_summary_fail(self, msg: str) -> None:
         self._summary_busy = False
@@ -833,13 +1452,9 @@ class MainWindow(QMainWindow):
 
     @_guard_qt_callback
     def _on_sub_line(self, txt: str) -> None:
+        """字幕定版行 → 只进字幕窗（2026-10-24 三功能解耦：字幕不落稿）。"""
         if self.sub_win is not None:
             self.sub_win.add_line(txt)
-        if self.transcript is not None:          # 边转边落盘（不封顶，不受字幕窗 200 行限制）
-            try:
-                self.transcript.add(txt)
-            except Exception:                    # noqa: BLE001
-                pass
 
     @_guard_qt_callback
     def _on_sub_partial(self, txt: str) -> None:
@@ -888,20 +1503,57 @@ class MainWindow(QMainWindow):
         if self.rec is None:
             return
         state = self.rec.snapshot()["state"]
+        hms = _fmt_hms(self.rec.snapshot()["seconds"])
         if state == "paused":
             self.rec.resume()
             self.btn_pause.setText("暂停")
             self.meter.set_active(True)
+            # 2026-10-25：底部控制条 ← 「录音中」+ [暂停][停止]
+            self._panel.set_rec_controls("recording", "录音中 %s" % hms)
             self._set_status("已继续录音。")
         elif state == "recording":
             self.rec.pause()
             self.btn_pause.setText("继续")
             self.meter.set_active(False)
+            # 2026-10-25：底部控制条 ← 「已暂停」+ [继续][停止]
+            self._panel.set_rec_controls("paused", "已暂停 %s" % hms)
             self._set_status("已暂停（计时与文件已冻结，点“继续”接着录）。")
+
+    def _pick_capture_target(self):
+        """采集目标选择：**有应用在放声就按应用录**（2026-10-25 用户拍板）。
+
+        为什么改：设备回环（WASAPI loopback）采的是端点混音输出，**系统音量会
+        直接压低录音电平**（实测一段 -14LUFS 素材被录成 -40dBFS RMS）。进程回环
+        （ApplicationLoopback）取的是**端点音量之前**的信号，系统音量再低、
+        甚至静音都不影响（2026-10-24 实测静音下峰值 0.985）。
+
+        返回 (pid, 应用名, 是否静音)：
+          · record_by_app=True 且有应用在放声 → (pid, 名字, muted)：只录那个应用；
+            目标应用中途退出时 Recorder 会自动换最响的应用，没有则回退设备回环；
+          · 没有应用在放声 → (0, "", muted)：设备回环（跟系统混音）。
+          · record_by_app=False → 永远设备回环（老行为，可在设置里关）。
+        """
+        try:
+            from . import process_loopback as pl
+            muted, _vol = pl.system_muted()
+            if bool(self.cfg.get("record_by_app", True)):
+                procs = pl.active_audio_procs()
+                me = os.getpid()
+                procs = [p for p in procs if int(p[0]) != me]     # 别录自己
+                if procs:
+                    pid, pname, _peak = procs[0]
+                    return int(pid), pname, muted
+            return 0, "", muted
+        except Exception as e:                   # noqa: BLE001  探测失败 → 老路径
+            import sys
+            print("_pick_capture_target 失败（回退设备回环）：%s: %s"
+                  % (type(e).__name__, e), file=sys.stderr)
+            return 0, "", False
 
     def _start_rec(self) -> None:
         data = self.combo_fmt.currentData() or ("mp3", 192)
         fmt, br = data
+        proc_pid, proc_name, muted = self._pick_capture_target()
         cfg = RecorderConfig(
             device_index=self.combo_device.currentData(),
             formats=[fmt],
@@ -909,6 +1561,11 @@ class MainWindow(QMainWindow):
             out_dir=self._out_dir(),
             segment_minutes=int(self.cfg.get("segment_minutes", 120) or 0),
             follow_default=bool(self.cfg.get("follow_default", True)),
+            process_pid=proc_pid,
+            # 2026-10-25：录音端自动增益（很小声时放大再存盘，而不是只在转写时放大）
+            auto_gain=bool(self.cfg.get("record_auto_gain", True)),
+            # 2026-10-26：人声增强档位（off / mild / strong，设置里三选一）
+            voice_boost=_voice_boost_mode(self.cfg.get("record_voice_boost")),
         )
         try:
             self.rec = Recorder(cfg, on_event=self._rec_event_bridge)
@@ -936,21 +1593,35 @@ class MainWindow(QMainWindow):
             self.act_toggle.setText("停止录音")
             self.tray.setToolTip("AI语音摘要 · 录音中 00:00:00")
         snap = self.rec.snapshot()
-        self._set_status("正在录音：%s（系统音量即使为 0 也不影响录制）" % snap.get("device_name", ""))
-
-        # 后台转文字：录音一开就把转写稿建起来（不弹字幕窗，只落盘）
-        auto_tr = bool(self.cfg.get("auto_transcribe", True))
-        if auto_tr or self._sub_on:
-            self._begin_transcript()
-        if auto_tr:
-            if self._start_transcribe_bg():
-                self._panel.toast("已开始后台转文字，停止后自动生成摘要。", 4500)
+        if proc_pid:
+            self._set_status("正在录音：%s（按应用录制，系统音量不影响电平）"
+                             % (proc_name or "#%d" % proc_pid))
+        else:
+            self._set_status("正在录音：%s" % snap.get("device_name", ""))
+        if proc_pid:
+            if muted:
+                self._panel.toast("系统静音 → 已按进程录制：%s（无视系统静音）"
+                                  % (proc_name or "#%d" % proc_pid), 5000)
             else:
-                self._panel.toast("后台转文字没起来（见状态栏），录音照常。", 5000, warn=True)
+                self._panel.toast("按应用录制：%s（取音量之前的信号，系统音量再低也不影响）"
+                                  % (proc_name or "#%d" % proc_pid), 4000)
+        elif muted:
+            self._panel.toast("系统是静音的，且当前没有应用在放声——这次录不到声音。"
+                              "先播放/打开要录的声音再点录音。", 6000, warn=True)
+        # 2026-10-25 用户需求：录音中底部出 [暂停][停止] 控制条（带计时）；
+        # 静音警告并入控制条文字（随后 toast 会被控制条覆盖，警告不丢）
+        tip = "录音中 00:00:00"
+        if proc_pid:
+            tip += "（按进程录制，无视系统静音）"
+        elif muted:
+            tip += "（系统静音，可能录不到声音）"
+        self._panel.set_rec_controls("recording", tip)
 
     def _stop_rec(self) -> None:
         if self.rec is None:
             return
+        # 2026-10-25：先收起录音控制条（无论后续走哪个分支，暂停/停止按钮都要退出）
+        self._panel.set_rec_controls("none", "")
         self._timer.stop()
         r = self.rec.stop()
         self.rec = None
@@ -978,25 +1649,24 @@ class MainWindow(QMainWindow):
                 name += "（等 %d 个文件）" % len(files)
             gap = r.get("gap_seconds", 0.0)
             note = "，补齐静音缺口 %.1f 秒" % gap if gap > 0.5 else ""
+            # 2026-10-25 用户方案 A：录完音才预热（子进程加载模型），
+            # 开机空闲不再占内存；用户点摘要时模型已就绪。
+            self._warm_summary_asr_async(delay_s=1.0)
             # 2026-10-23 Q6=A：独立录音窗已移除，"已保存"态的动作按钮搬到面板 toast
             self._panel.toast_actions(
                 "已保存：%s（时长 %.1f 秒%s）" % (name, r["seconds"], note),
                 [("打开目录", self._open_out_dir),
                  ("改名…", self._rename_last_files),
-                 ("丢弃", self._discard_last_files)])
+                 # 丢弃是破坏性操作：点完就地收起（其余按钮点完保留，
+                 # 2026-10-25 用户要求"不要点一下就全消失"）
+                 ("丢弃", self._discard_last_files, False)])
         else:
             self._set_status("已停止。")
 
-        # ---- 收尾：先停后台转写（避免还有行写进来）→ 再关转写稿 → 自动摘要 ----
+        # 2026-10-24 三功能解耦：录音只负责存音频。
+        # 转写/摘要不再在停止时触发——点「开始 AI 摘要」时摘要自己现场转写。
         if self._sub_auto:
             self._stop_subtitle()
-        text = self._finish_transcript()
-        if text.strip():
-            n = len(text)
-            self._panel.toast("转写稿已保存（%d 字）%s" % (
-                n, "，正在生成摘要…" if self.cfg.get("auto_summary", True) else ""), 5000)
-            if self.cfg.get("auto_summary", True):
-                self._start_summary(text, auto=True)
 
     # ---------------- 停止后的"保存 / 丢弃"流程 ----------------
 
@@ -1034,6 +1704,10 @@ class MainWindow(QMainWindow):
         对话框与文件操作分离（_ask_save_name / _rename_record_files / _discard_files），
         便于自动化测试直接覆盖各分支。
         """
+        # 2026-10-26 修复：重构对话框与文件操作分离时漏掉了 extra 的定义，
+        # 导致停止录音后弹保存框时 NameError（_guard_qt_callback 吞掉了，表现为
+        # "停止后没有保存提示"）。
+        extra = "，共 %d 个文件" % len(files) if len(files) > 1 else ""
         box = msgbox.choose(
             self, "录音已停止",
             "本次录音已停止（时长 %s%s）。\n\n要保存吗？"
@@ -1123,6 +1797,9 @@ class MainWindow(QMainWindow):
         if self._recording:
             # Q6=A：录音卡片实时显示「■ 录音中 HH:MM:SS」
             self._panel.set_record_time(_fmt_hms(snap["seconds"]))
+            # 2026-10-25：底部控制条同步计时（暂停时文案为「已暂停」）
+            _label = "已暂停" if snap.get("state") == "paused" else "录音中"
+            self._panel.update_rec_text("%s %s" % (_label, _fmt_hms(snap["seconds"])))
         if self.tray and self._recording:
             self.tray.setToolTip("AI语音摘要 · 录音中 %s" % _fmt_hms(snap["seconds"]))
 
@@ -1230,6 +1907,7 @@ class MainWindow(QMainWindow):
         # 界面是独立面板窗口；主窗口只是逻辑载体（2026-10-18）
         panel = getattr(self, "_panel", None)
         if panel is not None:
+            self._restore_panel_top()          # 强制恢复置顶：置顶窗口必然可见
             panel.show()
             panel.raise_()
             panel.activateWindow()
@@ -1265,3 +1943,118 @@ class MainWindow(QMainWindow):
                 self._quit()
             else:
                 ev.accept()
+
+
+    def _has_assoc(self, ext: str) -> bool:
+        """该扩展名在注册表里有没有可用的"打开命令"（2026-10-26）。
+
+        统一走 `_open_command()`，它会把 HKCR / UserChoice 依次解析成命令行；
+        解析不到才算"没有关联"。
+        """
+        return bool(self._open_command(ext))
+
+    def _open_command(self, ext: str) -> str:
+        """把扩展名解析成具体命令行（含程序路径），解析不到返回 ""（2026-10-26）。
+
+        为什么不用 `os.startfile`：它只认注册表当前关联。实测（2026-10-26）：
+        `HKCR\\.md` 被关联到 **WorkBuddy.md**（本会话宿主），于是
+        `os.startfile(md)` 把文件交给了 WorkBuddy —— 用户看到的"点了没反应"
+        （Typora 根本没被调起）。用户要的是**用真正处理该格式的编辑器**打开。
+        解析顺序：
+          ① `HKCU ...\\FileExts\\.<ext>\\UserChoice` 的 Progid（用户显式设置）
+          ② `HKCR\\.<ext>` 默认值 → Progid
+          ③ 逐层下钻 Progid\\shell\\open\\command，取命令行
+        返回的命令行里含 `%1` 占位符，调用方用文件名替换。
+        """
+        if not ext:
+            return ""
+        import winreg
+        progids = []
+        try:                                   # ① 用户显式设置
+            k = (r"Software\Microsoft\Windows\CurrentVersion\Explorer"
+                 r"\FileExts\%s\UserChoice" % ext)
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, k) as hk:
+                v, _ = winreg.QueryValueEx(hk, "Progid")
+                if v:
+                    progids.append(str(v))
+        except Exception:                      # noqa: BLE001
+            pass
+        try:                                   # ② 经典关联
+            with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, ext) as hk:
+                v, _ = winreg.QueryValueEx(hk, "")
+                if v:
+                    progids.append(str(v))
+        except Exception:                      # noqa: BLE001
+            pass
+        for pid in progids:
+            for path in (r"%s\shell\open\command" % pid,
+                         r"Applications\%s\shell\open\command" % pid):
+                try:
+                    with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, path) as hk:
+                        cmd, _ = winreg.QueryValueEx(hk, "")
+                        if cmd and str(cmd).strip():
+                            return str(cmd).strip()
+                except Exception:              # noqa: BLE001
+                    continue
+        return ""
+
+
+class LevelMeter(QWidget):
+    """实时电平表：RMS 渐变色条 + Peak 白刻度（-60..0 dBFS 映射 0..100%）。
+
+    空闲（未录音）时显示用途提示文字，录音中显示动态电平。
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.setMinimumHeight(26)
+        self.setMaximumHeight(26)
+        self._rms = -120.0
+        self._peak = -120.0
+        self._idle = True
+
+    def set_active(self, active: bool) -> None:
+        """录音状态切换：空闲时显示提示文字，录音时显示动态电平。"""
+        self._idle = not active
+        if not active:
+            self._rms = self._peak = -120.0
+        self.update()
+
+    def set_levels(self, rms_dbfs: float, peak_dbfs: float) -> None:
+        self._rms = rms_dbfs
+        self._peak = peak_dbfs
+        self.update()
+
+    @staticmethod
+    def _pct(db: float) -> float:
+        return max(0.0, min(100.0, (db + 60.0) / 60.0 * 100.0))
+
+    def paintEvent(self, ev):  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor("#1E2129"))
+        p.drawRoundedRect(0, 0, w, h, 6, 6)
+        if self._idle:
+            # 空闲态：显示用途提示（消除"这条黑块是什么"的困惑——2026-10-16 用户反馈）
+            p.setPen(QColor("#8E97A6"))
+            f = p.font()
+            f.setPixelSize(11)
+            p.setFont(f)
+            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "实时电平 · 录音时显示")
+            p.end()
+            return
+        rms_w = int(w * self._pct(self._rms) / 100.0)
+        if rms_w > 0:
+            g = QLinearGradient(0, 0, w, 0)
+            g.setColorAt(0.0, QColor("#3FBF6B"))
+            g.setColorAt(0.65, QColor("#E8C86A"))
+            g.setColorAt(1.0, QColor("#E0563F"))
+            p.setBrush(g)
+            p.drawRoundedRect(0, 0, max(rms_w, 8), h, 6, 6)
+        pk_x = int(w * self._pct(self._peak) / 100.0)
+        if pk_x > 0:
+            p.setPen(QPen(QColor("#F2F2F2"), 2))
+            p.drawLine(min(pk_x, w - 2), 3, min(pk_x, w - 2), h - 3)
+        p.end()

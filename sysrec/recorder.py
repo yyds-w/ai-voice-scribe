@@ -48,7 +48,7 @@ import numpy as np
 
 from . import config as config_mod
 from .audio_source import FALLBACK_NAME, AudioSourceTracker, sanitize_app_name
-from .capture import LoopbackCapture
+from .capture import make_capture
 from .devices import default_loopback_device
 from .encoder import make_encoder, normalize_fmt
 
@@ -81,6 +81,37 @@ def _prevent_sleep(on: bool) -> None:
         pass
 
 
+def design_voice_kernel(sr: int, presence_db: float = 2.5, mud_db: float = 1.5,
+                        taps: int = 257):
+    """人声增强 FIR（2026-10-26）：高通去轰鸣 + 去浑浊 + 2.8k 存在感 + 空气感。
+
+    用逆 FFT 法按频响曲线设计**线性相位** FIR（不改相位 → 不会有"闷/糊"），
+    再把 1kHz 处的实际响应归一到 0dB —— 只改音色，不改整体响度（增益交给 AGC）。
+    实测响应（48k、257 抽头）：60Hz -4.8 ｜ 200Hz -2.9 ｜ 1k 0.0 ｜ 2.8k +2.1。
+    """
+    n = int(taps)
+    freqs = np.fft.rfftfreq(8192, 1.0 / float(sr))
+
+    def curve(f):
+        db = np.where(f < 60, -12.0, 0.0)
+        db = np.where((f >= 60) & (f < 120), -12.0 * (120 - f) / 60.0, db)
+        db = db - mud_db * np.exp(-0.5 * ((np.log2(np.maximum(f, 1.0) / 200.0)) / 0.55) ** 2)
+        db = db + presence_db * np.exp(-0.5 * ((np.log2(np.maximum(f, 1.0) / 2800.0)) / 0.75) ** 2)
+        db = db + 1.5 * np.clip((f - 7000) / 4000.0, 0, 1)
+        return db
+
+    mag = 10 ** (curve(freqs) / 20.0)
+    spec = np.zeros(8192, dtype=complex)
+    spec[:len(mag)] = mag
+    spec[len(mag):] = mag[-2:0:-1].conj()
+    k = np.fft.ifft(spec).real
+    k = np.roll(k, n // 2)[:n] * np.hanning(n)
+    H = np.abs(np.fft.rfft(k, 8192))
+    f = np.fft.rfftfreq(8192, 1.0 / float(sr))
+    g1k = float(np.interp(1000.0, f, H))
+    return (k / max(g1k, 1e-6)).astype(np.float32)
+
+
 @dataclass
 class RecorderConfig:
     device_index: int | None = None      # None = 自动跟随系统默认输出
@@ -92,6 +123,9 @@ class RecorderConfig:
     follow_default: bool = True          # 录音中默认输出切换时自动跟随续录
     name_by_source: bool = True          # 停止时按"音频来源应用"命名（2026-10-23）
     no_source_name: str = FALLBACK_NAME  # 检测不到来源时的名字（Q4=A：系统声音）
+    process_pid: int = 0                 # >0 = 按进程捕获（无视系统静音，2026-10-24）
+    auto_gain: bool = True               # 录音端自动增益（2026-10-25，很小声时放大再存盘）
+    voice_boost: str = "mild"            # 人声增强：off / mild / strong（2026-10-26）
 
 
 class Recorder:
@@ -101,6 +135,13 @@ class Recorder:
         self.cfg = cfg
         self.on_event = on_event                 # on_event(kind: str, payload)
         self._state = "idle"                     # idle | recording | paused
+        self._agc_gain = 1.0                     # 当前录音增益（自动增益用）
+        self._agc_packets = 0
+        # 人声增强档位：只认 mild / strong（"off"、空值、非法值一律等于不做 EQ）
+        _vb = str(cfg.voice_boost or "off").strip().lower()
+        self._eq_mode = _vb if (cfg.auto_gain and _vb in ("mild", "strong")) else ""
+        self._eq_kernel = None
+        self._eq_tail = []
         self._q = queue.Queue(maxsize=512)
         self._capture = None
         self._encoders = []
@@ -142,7 +183,8 @@ class Recorder:
             if idx is None:
                 raise RuntimeError("找不到可用的回环录音设备（系统里没有可录的输出端点）。")
 
-        self._capture = LoopbackCapture(idx, self._on_audio, on_error=self._on_capture_error)
+        self._capture = make_capture(idx, self._on_audio, on_error=self._on_capture_error,
+                                     process_pid=self.cfg.process_pid)
         try:
             self._capture.start()
         except Exception:
@@ -431,6 +473,78 @@ class Recorder:
             self._gap_frames += gap
             self._level_rms = self._level_peak = 0.0
 
+    # ---- 录音端自动增益（2026-10-25/26）----
+    # 参数定档（用户 A/B 试听后选 N）：峰值目标 0.71（-3dBFS）、上限 32×、
+    # 超过 0.70 的峰值做软限幅到 0.95（实测只动 0.65% 的样本，听不出失真）。
+    # 只放大不压小；快降慢升（0.35/0.05）避免抽气。
+    AGC_TARGET = 0.71
+    AGC_MAX_GAIN = 32.0
+    LIMIT_THR = 0.70
+    LIMIT_CEIL = 0.95
+
+    def _ensure_eq(self) -> None:
+        """按当前采样率设计人声增强 FIR（1kHz 归 0dB，只改音色不改响度）。"""
+        if self._eq_kernel is not None or not self._eq_mode:
+            return
+        sr = int(self._sr or 48000)
+        presence, mud = (2.5, 1.5) if self._eq_mode == "mild" else (4.0, 3.0)
+        self._eq_kernel = design_voice_kernel(sr, presence, mud)
+        self._eq_tail = [None] * max(1, int(self._ch or 2))
+
+    def _apply_eq(self, samples: np.ndarray) -> np.ndarray:
+        """线性相位 FIR 人声增强（重叠相加，流式无接缝）。"""
+        k = self._eq_kernel
+        if k is None:
+            return samples
+        n = len(samples)
+        chs = []
+        for c in range(samples.shape[1]):
+            full = np.convolve(samples[:, c], k, mode="full")
+            seg = full[:n].copy()
+            tail = self._eq_tail[c]
+            if tail is not None:
+                m = min(len(tail), n)
+                seg[:m] += tail[:m]
+            self._eq_tail[c] = full[n:]
+            chs.append(seg)
+        return np.stack(chs, axis=1).astype(np.float32)
+
+    def _soft_limit(self, y: np.ndarray) -> np.ndarray:
+        """只压超过 LIMIT_THR 的峰值（阈值以下完全透明）。"""
+        a = np.abs(y)
+        over = a > self.LIMIT_THR
+        if not np.any(over):
+            return y
+        span = self.LIMIT_CEIL - self.LIMIT_THR
+        a[over] = self.LIMIT_THR + span * np.tanh((a[over] - self.LIMIT_THR) / span)
+        return (np.sign(y) * a).astype(np.float32)
+
+    def _apply_agc(self, samples: np.ndarray) -> np.ndarray:
+        """RECORDER 增益链：人声增强（可选）→ 峰值自适应增益 → 软限幅。
+
+        2026-10-26 用户 A/B 后定档：峰值 0.71 / 上限 32× / 软限幅 0.70→0.95。
+        实测（6 分钟 -40dBFS 录音）：RMS -40.7 → -14.0 dBFS（接近视频响度），
+        软限幅只触及 0.65% 样本，无硬削波。
+        """
+        if self._eq_mode:
+            self._ensure_eq()
+            samples = self._apply_eq(samples)
+        try:
+            peak = float(np.max(np.abs(samples))) if len(samples) else 0.0
+        except Exception:                                   # noqa: BLE001
+            return samples
+        if peak > 1e-5:
+            want = min(self.AGC_MAX_GAIN, max(1.0, self.AGC_TARGET / peak))
+            if self._agc_packets < 8:                       # 开录头几包直接定档
+                self._agc_gain = want
+            else:
+                alpha = 0.35 if want < self._agc_gain else 0.05   # 快降 / 慢升
+                self._agc_gain += alpha * (want - self._agc_gain)
+        self._agc_packets += 1
+        if abs(self._agc_gain - 1.0) < 0.02:
+            return self._soft_limit(samples)
+        return self._soft_limit(samples * float(self._agc_gain))
+
     def _write_packet(self, t: float, samples: np.ndarray) -> None:
         if self._paused:
             self._level_rms = self._level_peak = 0.0
@@ -438,6 +552,12 @@ class Recorder:
         n = int(samples.shape[0])
         if n <= 0:
             return
+        # 0) 自动增益（2026-10-25）：设备回环录的是"音量之后"的信号，
+        #    系统音量低就会录出很小声的文件（实测一段 -14LUFS 素材录成 -40dBFS）。
+        #    float32 只是被数字缩小，乘回来几乎无损；放大后再编码 mp3，
+        #    编码器还会把更多比特分给这段信号。
+        if self.cfg.auto_gain:
+            samples = self._apply_agc(samples)
         # 1) 缺口补零
         expected = int((t - self._t_anchor) * self._sr)
         gap = compute_gap_frames(expected, self._frames_written, n, self._gap_threshold)
@@ -513,6 +633,17 @@ class Recorder:
         """采集流报错后的恢复：重开当前设备，失败则换默认回环。"""
         if self._state == "idle":
             return
+        # 进程级捕获：目标应用可能已退出 → 换成当前最响的应用；都没有则回退设备级
+        if self.cfg.process_pid:
+            try:
+                from .process_loopback import active_audio_procs
+                procs = active_audio_procs()
+            except Exception:                    # noqa: BLE001
+                procs = []
+            self.cfg.process_pid = procs[0][0] if procs else 0
+            if not self.cfg.process_pid:
+                self._emit("error", "目标应用已退出，且当前没有应用在放声 → 已回退设备级采集"
+                                   "（系统静音时仍然录不到，请调高系统音量或先播放声音）。")
         idx = self._cur_device_index
         for target in (idx, None):
             if target is None:
@@ -521,7 +652,9 @@ class Recorder:
             if target is None:
                 continue
             try:
-                new = LoopbackCapture(target, self._on_audio, on_error=self._on_capture_error)
+                new = make_capture(target, self._on_audio,
+                                   on_error=self._on_capture_error,
+                                   process_pid=self.cfg.process_pid)
                 new.start()
             except Exception as e:  # noqa: BLE001
                 self._emit("error", "重开采集流失败（设备 %s）：%s" % (target, e))
@@ -538,6 +671,8 @@ class Recorder:
         self._emit("error", "采集流已中断，且自动恢复失败。请停止后重新开始。")
 
     def _switch_device(self, idx: int) -> None:
+        if self.cfg.process_pid:
+            return                           # 进程级捕获不跟随默认输出设备（与端点无关）
         old = self._capture
         old_idx = self._cur_device_index
         if old is not None:
@@ -545,7 +680,7 @@ class Recorder:
                 old.stop()
             except Exception:  # noqa: BLE001
                 pass
-        new = LoopbackCapture(idx, self._on_audio, on_error=self._on_capture_error)
+        new = make_capture(idx, self._on_audio, on_error=self._on_capture_error)
         try:
             new.start()
         except Exception as e:  # noqa: BLE001
@@ -569,7 +704,8 @@ class Recorder:
         if idx is None:
             return
         try:
-            back = LoopbackCapture(idx, self._on_audio, on_error=self._on_capture_error)
+            back = make_capture(idx, self._on_audio, on_error=self._on_capture_error,
+                                process_pid=self.cfg.process_pid)
             back.start()
             self._capture = back
             self._cur_device_index = idx

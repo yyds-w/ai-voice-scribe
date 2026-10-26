@@ -20,7 +20,7 @@ from PyQt6.QtCore import QObject, pyqtSignal
 
 from . import devices
 from .asr import Asr
-from .capture import LoopbackCapture
+from .capture import make_capture
 
 SR = 16000
 RMS_GATE = 0.008        # 绝对下限：全静音时别把门槛压到 0
@@ -47,10 +47,15 @@ class SubtitleEngine(QObject):
     status = pyqtSignal(str)
     failed = pyqtSignal(str)
 
-    def __init__(self, device_index=None, cfg=None, parent=None):
+    def __init__(self, device_index=None, cfg=None, parent=None, process_pid: int = 0):
         super().__init__(parent)
         c = dict(cfg or {})
         self.device_index = device_index
+        self.process_pid = int(process_pid or 0)   # >0 = 按进程捕获（无视系统静音）
+        # 2026-10-25：字幕定版用的 SenseVoice 跟流式模型同口径（默认 CPU）。
+        # 定版是一句一句的短音频（2~8s），实测短句 GPU 反而慢 2.6 倍
+        # （109ms vs 42ms，每次 decode 的固定开销 ~67ms），内存还多 300MB
+        # （cuda 620MB vs cpu 317MB）。要用 GPU 把 subtitle_provider 改 "cuda"。
         self._asr = Asr(
             model_dir=(c.get("asr_model_dir") or None),
             vad_threshold=float(c.get("vad_threshold", 0.50)),
@@ -58,7 +63,10 @@ class SubtitleEngine(QObject):
             vad_min_silence=float(c.get("vad_min_silence", 0.10)),
             gate_sec=float(c.get("vad_gate_sec", 0.25)),
             auto_gain=bool(c.get("auto_gain", True)),
+            provider=c.get("subtitle_provider", "cpu"),     # 2026-10-25 GPU 加速
         )
+        # 字幕草稿轨（流式）默认 CPU：2026-10-24 实测流式上 GPU 慢 3 倍
+        self._stream_provider = c.get("subtitle_provider", "cpu")
         self._cap = None
         self._running = False
         self._lock = threading.Lock()
@@ -106,6 +114,8 @@ class SubtitleEngine(QObject):
         # rule1 放宽到 1.0s，再加这道门槛挡掉识别初期的不稳定残句。
         self.endpoint_sec = float(c.get("subtitle_endpoint_sec", 1.0))
         self.ep_min_chars = int(c.get("subtitle_ep_min_chars", 6) or 0)
+        # 换行最小字数（2026-10-24 用户要求：一行至少攒够 N 字才换行）
+        self.min_line_chars = int(c.get("subtitle_min_line_chars", 100) or 0)
         self.max_chars = int(c.get("subtitle_max_chars", 500) or 0)
         self._ep_hit = False              # 流式块里查到 endpoint → 锁内立即定版
 
@@ -123,7 +133,8 @@ class SubtitleEngine(QObject):
         if idx is None:
             self.failed.emit("找不到可用的回环录音设备（不是扬声器回环）。")
             return False
-        if not self._asr.ready():
+        # 2026-10-25：stream 模式不需要 SenseVoice（定版不重转），别再因此拒绝启动
+        if self.mode != "stream" and not self._asr.ready():
             self.failed.emit(
                 "找不到 SenseVoice 模型：\n%s\n\n"
                 "模型在「AI面试软件\\interview_assistant\\models」下；"
@@ -131,8 +142,9 @@ class SubtitleEngine(QObject):
                 % self._asr.model_hint())
             return False
         try:
-            self._cap = LoopbackCapture(int(idx), self._on_audio,
-                                        on_error=self._on_cap_error)
+            self._cap = make_capture(int(idx), self._on_audio,
+                                     on_error=self._on_cap_error,
+                                     process_pid=self.process_pid)
             self._cap.start()
         except Exception as e:                      # noqa: BLE001
             self._cap = None
@@ -160,16 +172,29 @@ class SubtitleEngine(QObject):
             self._last_preview = 0
             self._seq += 1
             self._busy = False
+        # 2026-10-24：成行有最小字数门槛后，停止时必须把不足门槛的尾段也上屏，
+        # 否则最后一句（往往是最重要的一句）会被清掉。
+        tail = (self._stream_text or "").strip()
         self._stream_sess = None
         self._stream_text = ""
+        if tail:
+            try:
+                self._finalize_stream(tail, force=True)
+            except Exception:                       # noqa: BLE001
+                pass
         self.status.emit("实时转文字已关闭")
 
     # ---------- 内部 ----------
     def _warm(self):
         try:
-            self._asr.warmup()
-            self._ensure_stream()          # 顺便把流式模型也预加载（失败自动回退）
-            self._ensure_punct()           # 单模型模式：标点模型也预加载
+            # 2026-10-25：stream 模式不加载 SenseVoice——定版只用流式文本 + 标点模型
+            # + 术语纠错（_finalize_stream），SenseVoice 只服务 dual 模式的"定版重转"。
+            # 原来无差别 warmup：stream 模式下白吃 ~640MB（cuda 版还要建 CUDA 上下文），
+            # 这是"字幕一开就占九百多兆"的主因（Paraformer 只要 227MB）。
+            if self.mode != "stream":
+                self._asr.warmup()
+            self._ensure_stream()          # 流式模型（字幕主力）
+            self._ensure_punct()           # 单模型模式：标点模型（语义断句）
             if self._running:
                 self.status.emit("识别模型已就绪，说话就出字")
         except Exception as e:                      # noqa: BLE001
@@ -185,7 +210,8 @@ class SubtitleEngine(QObject):
             from .stream_asr import StreamingASR
             m = StreamingASR(threads=2,
                              endpoint_rule1_silence=self.endpoint_sec,
-                             endpoint_max_utterance=60.0)
+                             endpoint_max_utterance=60.0,
+                             provider=self._stream_provider)   # 2026-10-24 GPU 加速（默认 CPU）
             if m.ready():
                 m.ensure()
                 self._stream_asr = m
@@ -247,12 +273,13 @@ class SubtitleEngine(QObject):
             return None
         return marked if marked[-1] in "。！？；!?;" else None
 
-    def _finalize_stream(self, text, already_punct=False):
+    def _finalize_stream(self, text, already_punct=False, force=False):
         """单模型模式的「定版」：**不重转**，只给同一段流式文本补标点后上屏。
 
         这是"不跳字"的关键：定版内容与草稿同源，用户只会看到多了几个标点，
         不会出现"草稿写 A、定版变成 B"的跳变。
         already_punct=True：文本已由 _punct_confirms 加过标点，跳过重复推理。
+        force=True：忽略 running 检查（停止字幕时把尾段补上屏，2026-10-24）。
         """
         t = (text or "").strip()
         if not t:
@@ -265,7 +292,7 @@ class SubtitleEngine(QObject):
             p = self._ensure_punct()
             if p is not None:
                 t = p.add(t)
-        if t and self._running:
+        if t and (self._running or force):
             self.line.emit(t)
 
     def _on_cap_error(self, why):
@@ -345,6 +372,15 @@ class SubtitleEngine(QObject):
             # 没有它段落会无限变长）。只对 stream 模式有意义（dual 按 60s 音频兜底）。
             over_chars = (self.max_chars > 0 and self.mode == "stream"
                           and len(self._stream_text or "") >= self.max_chars)
+            # 2026-10-24 用户要求：一行至少攒够 min_line_chars 字才换行。
+            # 未达标时把端点/能量门/字数兜底全部压下（单段上限也不能低于成行门槛，
+            # 否则会出现"50 字就切"与"至少 100 字"互相打架）；只对 stream 模式生效——
+            # dual 模式没有流式文本，靠音频时长兜底。停止时会强制把尾段上屏。
+            if (self.mode == "stream" and self.min_line_chars > 0
+                    and len((self._stream_text or "").strip()) < self.min_line_chars):
+                ep = False
+                said_done = False
+                over_chars = False
             if said_done or hard or ep or over_chars:
                 if self._speech < int(self.min_speech_sec * SR) and not (ep or over_chars):
                     # 纯静音 / 键盘 / 提示音：丢掉，不调模型

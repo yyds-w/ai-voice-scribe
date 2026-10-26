@@ -166,6 +166,8 @@ def _run() -> int:
         return 0
 
     from sysrec.gui import MainWindow
+    # 注意：w 必须保留 Python 引用——Qt 窗口无引用会被 GC 回收，
+    # 表现为"面板启动后立刻消失"。不要改成丢弃返回值的写法。
     w = MainWindow(ipc_server=server, logger=_log)
     # 2026-10-18：主窗口只作逻辑载体（托盘/IPC）；界面是 MainWindow 内部的独立浮动面板，
     # 构造时已自行 place_default + show。不再显示空的主窗口。
@@ -197,6 +199,11 @@ def _fatal_notice(tb: str) -> None:
 
 
 if __name__ == "__main__":
+    # 摘要转写子进程入口（2026-10-25 方案 B）：打包后 exe 靠这个开关以 worker 身份启动，
+    # 源码模式下 asr_client 走 `-m sysrec.asr_worker`，不会用到这里。
+    if "--asr-worker" in sys.argv:
+        from sysrec.asr_worker import main as _asr_worker_main
+        sys.exit(_asr_worker_main())
     try:
         sys.exit(_run())
     except Exception:

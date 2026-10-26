@@ -43,11 +43,25 @@ class Mp3Encoder:
 
     def __init__(self, path: str, sample_rate: int, channels: int, bitrate: int = 192):
         self._f = open(path, "wb")
-        self._e = lameenc.Encoder()
-        self._e.set_bit_rate(int(bitrate))
-        self._e.set_in_sample_rate(int(sample_rate))
-        self._e.set_channels(int(channels))
-        self._e.set_quality(2)           # 0 = 最慢最好, 9 = 最快；2 为高质量档
+        self._path = path
+        try:
+            self._e = lameenc.Encoder()
+            self._e.set_bit_rate(int(bitrate))
+            self._e.set_in_sample_rate(int(sample_rate))
+            self._e.set_channels(int(channels))
+            self._e.set_quality(2)
+        except Exception:
+            # 2026-10-26：构造失败不留半开句柄 / 0 字节文件
+            try:
+                self._f.close()
+            finally:
+                try:
+                    import os as _os
+                    if _os.path.getsize(path) == 0:
+                        _os.remove(path)
+                except Exception:
+                    pass
+            raise
 
     def write(self, samples: np.ndarray) -> None:
         if samples.size:

@@ -68,6 +68,9 @@ SPECS = [
     ("subtitle_ep_min_chars", "字幕节奏", "端点最小字数", 1, 20, 1, "字",
      "端点触发时不够这么多字就不定版（默认 6）——“嗯”“这个”级残句攒进下一句，"
      "挡掉识别初期的不稳定碎片。调大 → 行更少更长；调小 → 更接近原始断句。"),
+    ("subtitle_min_line_chars", "字幕节奏", "换行最少字数", 0, 300, 10, "字",
+     "**一行至少攒够这么多字才换行**（默认 100，0=不限）。端点/静音/字数兜底在这条"
+     "门槛前全部让路，避免字幕碎成一行几个字；停止字幕时不足门槛的尾段也会补上屏。"),
     ("subtitle_max_chars", "字幕节奏", "单段字数", 200, 2000, 100, "字",
      "定版文本达到该字数就强制收尾。防止放音乐 / 噪声时段落无限变长"
      "（字幕一行几千字会卡窗口）。默认 500。"),
@@ -90,6 +93,13 @@ SPECS = [
 ]
 
 CHECKS = [
+    ("record_by_app", "录音", "只录正在出声的应用（绕过系统音量）",
+     "开着：检测到有应用在放声就只录那个应用（进程回环，取音量之前的信号）——\n"
+     "系统音量调到 1% 甚至静音也能录清楚。关掉：录整个系统的混音（会跟系统音量走）。"),
+    ("record_auto_gain", "录音", "录音自动增益",
+     "音量很小时自动放大（最多 32 倍）再存盘，峰值超过 0.7 的部分软限幅到 0.95。\n"
+     "开着就不会录出 -40dBFS 那种小声文件（实测可到 -14dBFS，接近视频响度）；\n"
+     "代价是很安静的段落底噪也会被一起放大（数字底噪，通常听不出来）。"),
     ("auto_gain", "识别敏感度", "小声自动放大",
      "峰值低于 0.2 时先把音量拉到 0.7 再识别。治「面试官声音小」，代价是很安静的环境里可能把底噪一起放大。"),
     ("subtitle_capture_exclude", "字幕外观", "防截屏",
@@ -106,6 +116,20 @@ CHOICES = {
         ],
         "单模型：全程只用流式结果，定版只补标点 —— 文字与草稿完全一致，不会跳；代价是技术词准确率略低。\n"
         "双模型：说完一句再用 SenseVoice 整段重转 —— 更准，但定版文字会和草稿不同，看着像跳了一下。",
+    ),
+    # 人声增强（2026-10-26 用户要求：温和 / 加强 两档可选）——
+    # 与识别模式共用同一套下拉渲染/取值代码（_value/_set 已支持 QComboBox），
+    # 值直接就是 RecorderConfig.voice_boost 吃的字符串（off/mild/strong）。
+    "record_voice_boost": (
+        "人声增强",
+        [
+            ("关闭（保留原始音色）", "off"),
+            ("温和 · 2.8kHz +2.1dB（自然）", "mild"),
+            ("加强 · 2.8kHz +3.4dB（更清晰）", "strong"),
+        ],
+        "线性相位 FIR，1kHz 归一到 0dB —— 只改音色、不改响度（响度交给「录音自动增益」）。\n"
+        "两档都会：60Hz 以下去低频轰鸣、200Hz 去浑浊、2.8kHz 抬「人声清楚」那一段、7kHz 以上加空气感。\n"
+        "加强档中高频更靠前、听感更清晰；嫌尖（齿音重）就选温和档。",
     ),
 }
 
@@ -140,12 +164,15 @@ PRESETS = {
 def _fmt(key, v, unit):
     if not unit:
         return "%.2f" % v
-    if unit in ("ms", "px", "行"):
+    if unit in ("ms", "px", "行", "字", "天"):
         return "%d %s" % (round(v), unit)
     return "%.2f %s" % (v, unit)
 
 
 class SettingsDialog(QDialog):
+    # 「保存模型」即时生效（2026-10-25 方案①）：落盘后通知主窗口同步 LLM 配置
+    sig_llm_saved = pyqtSignal(dict)
+
     def __init__(self, cfg, parent=None):
         super().__init__(parent)
         self.cfg = dict(cfg)
@@ -222,8 +249,14 @@ class SettingsDialog(QDialog):
         for _k, g, _l, _h in CHECKS:          # 只有复选框、没有滑块的分组也要出卡片
             if g not in groups:
                 groups.append(g)
+        combos = {k: c for k, c in CHOICES.items() if k != "asr_mode"}   # 其余下拉归属分组
+        for _k, (label, _ch, _tip) in combos.items():
+            if label not in groups:
+                groups.append(label)
         for g in groups:
-            bl.addWidget(self._group_card(g, [s for s in SPECS if s[1] == g]))
+            bl.addWidget(self._group_card(
+                g, [s for s in SPECS if s[1] == g],
+                combos=[(k, v) for k, v in combos.items() if v[0] == g]))
         bl.addWidget(self._auto_card())
         bl.addWidget(self._llm_card())
         bl.addStretch(1)
@@ -288,7 +321,7 @@ class SettingsDialog(QDialog):
         self._rows["asr_mode"] = (combo, None, None, None)
         return card
 
-    def _group_card(self, name, specs):
+    def _group_card(self, name, specs, combos=()):
         card = QFrame()
         card.setObjectName("card")
         v = QVBoxLayout(card)
@@ -354,6 +387,25 @@ class SettingsDialog(QDialog):
             cb.setToolTip(hint)
             v.addWidget(cb)
             self._rows[key] = (cb, None, None, None)
+
+        # 归属本卡片的下拉（如「人声增强：关闭 / 温和 / 加强」）
+        for key, (label, choices, tip) in combos:
+            if label != name:                # 与卡片标题相同就不重复显示（2026-10-26）
+                lb = QLabel(label)
+                lb.setStyleSheet("color:%s;font-size:13px;" % TEXT)
+                v.addWidget(lb)
+            combo = _NoWheelComboBox()
+            for text, val in choices:
+                combo.addItem(text, val)
+            i = combo.findData(str(self.cfg.get(key, "")))
+            combo.setCurrentIndex(i if i >= 0 else 0)
+            combo.setToolTip(tip)
+            v.addWidget(combo)
+            hint = QLabel(tip)
+            hint.setObjectName("hint")
+            hint.setWordWrap(True)
+            v.addWidget(hint)
+            self._rows[key] = (combo, None, None, None)
         return card
 
     # ---------- 自动转写 / 自动摘要卡片 ----------
@@ -363,33 +415,24 @@ class SettingsDialog(QDialog):
         v = QVBoxLayout(card)
         v.setContentsMargins(16, 12, 16, 14)
         v.setSpacing(10)
-        h = QLabel("自动转写 / 自动摘要")
+        h = QLabel("摘要输出 / 缓存")
         h.setObjectName("grp")
         h.setStyleSheet("color:%s;font-size:13px;" % TEXT)
         v.addWidget(h)
-        tip = QLabel("录音一开始就在后台转文字（不弹字幕窗），逐行写进「转写」目录；"
-                     "停止录音后自动把文稿交给上面配的模型生成纪要，存进「摘要」目录。"
-                     "长会议会自动分段提炼再汇总，不会因为太长而漏掉中段。")
+        tip = QLabel("摘要自己负责转写：点「开始 AI 摘要」时，若本次没有字幕内容，"
+                     "会用本地 SenseVoice 把刚录的音频转成文字（离线、免费），"
+                     "转写稿存进「摘要缓存」，再交模型生成纪要存进「摘要」。"
+                     "缓存文件按保留天数自动清理。")
         tip.setObjectName("hint")
         tip.setWordWrap(True)
         v.addWidget(tip)
 
-        for key, label, hint in (
-            ("auto_transcribe", "录音时后台自动转文字",
-             "只记录文字，不改动录音本身。关掉后录音就只出音频文件。"),
-            ("auto_summary", "停止后自动生成摘要",
-             "会把本次转写全文发往上面填的 API 地址。不想联网就把这项关掉，"
-             "改用面板的「开始 AI 摘要」手动触发。"),
-        ):
-            cb = QCheckBox(label)
-            cb.setChecked(bool(self.cfg.get(key, True)))
-            cb.setToolTip(hint)
-            v.addWidget(cb)
-            self._rows[key] = (cb, None, None, None)
-
+        # 2026-10-24 三功能解耦：两个自动开关已删除（录音只录音、字幕只字幕、
+        # 摘要自己负责转写），这里只留"摘要"自己的输出位置与缓存策略。
         for key, label, default in (
-            ("transcript_dir", "转写目录", config_mod.default_transcript_dir()),
             ("summary_dir", "摘要目录", config_mod.default_summary_dir()),
+            ("summary_cache_dir", "摘要缓存目录",
+             config_mod.default_summary_cache_dir()),
         ):
             row = QHBoxLayout()
             row.setSpacing(10)
@@ -402,6 +445,31 @@ class SettingsDialog(QDialog):
             row.addWidget(ed, 1)
             v.addLayout(row)
             self._rows[key] = (ed, None, None, None)
+
+        # 摘要缓存保留天数（用户 Q4：默认 7 天，过期自动清理）
+        key, label, lo, hi, step, unit = ("summary_cache_keep_days", "缓存保留天数",
+                                          3, 90, 1, "天")
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        lab = QLabel(label)
+        lab.setFixedWidth(100)
+        row.addWidget(lab)
+        n = int(round((hi - lo) / step))
+        sl = _NoWheelSlider(Qt.Orientation.Horizontal)
+        sl.setRange(0, n)
+        cur = float(self.cfg.get(key, lo))
+        sl.setValue(max(0, min(n, int(round((cur - lo) / step)))))
+        sl.setToolTip("摘要缓存（自动转写的文字稿）保留多少天后自动删除。默认 7 天。")
+        row.addWidget(sl, 1)
+        val = QLabel(_fmt(key, lo + sl.value() * step, unit))
+        val.setFixedWidth(64)
+        val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        val.setStyleSheet("color:%s;font-size:12px;" % MUTED)
+        row.addWidget(val)
+        sl.valueChanged.connect(
+            lambda v_, k=key, l=lo, s=step, u=unit, lb=val: lb.setText(_fmt(k, l + v_ * s, u)))
+        v.addLayout(row)
+        self._rows[key] = (sl, val, (lo, hi, step), unit)
         return card
 
     # ---------- LLM 摘要卡片（2026-10-23 多 LLM 管理） ----------
@@ -662,6 +730,9 @@ class SettingsDialog(QDialog):
                 if 0 <= self._cur < len(self._profiles) else names[0]
         self.cfg["llm_active"] = self._active
         config_mod.save(self.cfg)                  # 立即落盘（只影响 LLM 相关键）
+        # 2026-10-25 方案①：落盘后立即生效——通知主窗口把 LLM 配置同步进运行内存
+        # （此前只写文件，主窗口内存要等全局「保存」或重启才换，用户感知"不生效"）
+        self.sig_llm_saved.emit(dict(self.cfg))
         if self._save_btn is not None:
             self._save_btn.setText("已保存 ✓")
             QTimer.singleShot(1500, self._restore_save_btn)
@@ -792,6 +863,11 @@ class SettingsDialog(QDialog):
             self._set("asr_mode", config_mod.DEFAULTS.get("asr_mode", "stream"))
             for key, _g, _l, _h in CHECKS:
                 self._set(key, config_mod.DEFAULTS.get(key, True))
+            # 下拉类也要回到默认（如人声增强：off/mild/strong）
+            for key, (_label, choices, _tip) in CHOICES.items():
+                if key == "asr_mode":
+                    continue
+                self._set(key, config_mod.DEFAULTS.get(key, choices[0][1]))
             return
         for k, v in patch.items():
             self._set(k, v)

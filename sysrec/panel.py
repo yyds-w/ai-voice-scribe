@@ -11,24 +11,21 @@ import math
 import os
 
 from PyQt6.QtCore import QPointF, QRect, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import (QBrush, QColor, QConicalGradient, QLinearGradient,
-                         QPainter, QPen, QPixmap, QPolygonF)
+from PyQt6.QtGui import (QBrush, QColor, QConicalGradient, QFont,
+                         QLinearGradient, QPainter, QPen, QPixmap, QPolygonF)
 from PyQt6.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel,
                              QPushButton, QVBoxLayout, QWidget)
 
 from . import app_paths
 
 PANEL_W = 560          # 面板尺寸：对标实机 ≈3.3:1 的宽扁浮窗
-PANEL_H = 186          # 2026-10-19：下方提示区高度减半（原 43px → 21px，208 → 186）
-REC_PANEL_H = 190      # 录音态需要更高的面板，容纳计时 / 电平 / 按钮
+# 2026-10-25 用户给定的状态表（只长不缩，任一时刻都不会"缩回去再撑开"）：
+#   启动空闲 186 → 开始录音 226 → 计时/停止/三选项/选项收起/普通提示 全部 226。
+# 226 = 186 + 40（动作按钮行高度），在"开始录音"那一下一次性长高，之后永不回缩。
+PANEL_H = 186          # 启动空闲高度（未录过音时紧凑显示）
+PANEL_H_REC = 226      # 开始录音后的固定高度（含动作按钮行）——只增不减
 ICON_SIDE = 72         # 卡片图标显示边长（图标为"圆盘+字形"整体，源图 324px）
 
-# 2026-10-23：toast 动作按钮行（打开目录/改名…/丢弃）的临时加高量。
-# 根因：186px 只按"纯文字 toast"设计（卡片底 164，底部仅剩 22px），
-# 按钮行是占布局控件（26px）→ 被 Qt 挤进卡片区与「开启字幕」重叠 21px。
-# 加高量按两层内容实测：卡片底 164 + 呼吸距 4 + toast 文字 12 + 间距 4
-# + 按钮 26 + 底边距 16 ≈ 46px，取 40（按钮行上方净空由 _place_toast 贴距保证）。
-ACTION_EXTRA_H = 40      # 有动作按钮时窗口临时加高量（186→226）
 ACTION_GAP_BOTTOM = 6    # 动作按钮行距窗口底边的缝（用户 2026-10-23 定：6px）
 FG_TOAST = "#C9D1DC"     # "已保存"提示行文字色：比 FG_DIM 亮一档（用户定）
 
@@ -57,14 +54,17 @@ CHIP = "#26FFFFFF"                   # 右上按钮片 ≈15% 白
 DARK_CUT = "#232A38"                 # 兜底图标里模拟"镂空"的深色
 BORDER = "#1AFFFFFF"   # 10%（QSS 与 QColor 都能解析 #AARRGGBB）
 
-# ---- 卡片点击后的三种状态（2026-10-20 新增）----
+# ---- 卡片点击后的三种状态（2026-10-20 新增 / 2026-10-24 统一蓝色）----
 # 语义：active=已开启（持续态）/ busy=处理中（临时态）/ done=刚完成（1.5s 反馈后回落）
 # 配色沿用面板既有的"深色底 + 白色图形"语言，只换强调色，不换布局与尺寸。
-CARD_ON = "#26FFD98F"        # 已激活：暖金 15% 底（再高会叠成橄榄色）
-CARD_ON_HOVER = "#38FFD98F"  # 已激活 + 悬停：22%
-BORDER_ON = "#C4FFD98F"      # 已激活：金色描边 77%
-FG_ON = "#FFF3D8"            # 已激活：近白微暖（不用纯金——12px 金字压在金底上会糊）
-ACCENT_ON = "#FFCE78"        # 已激活：金色指示点 / 图标光环
+# 2026-10-24 用户要求：录音/字幕"启动后"的配色与摘要的蓝色调一致 →
+# active 从暖金改为与 busy 同一套青蓝（形状已能区分：实心点 + 整圈光环 = 持续，
+# 缺口弧 + 空心圈 = 处理中）。
+CARD_ON = "#2678B6FF"        # 已激活：青蓝 15% 底（与 busy 同色系）
+CARD_ON_HOVER = "#3878B6FF"  # 已激活 + 悬停：22%
+BORDER_ON = "#C478B6FF"      # 已激活：青蓝描边 77%
+FG_ON = "#E6F1FF"            # 已激活：冷白（压在蓝底上清晰）
+ACCENT_ON = "#7FC0FF"        # 已激活：蓝色指示点 / 图标光环
 
 CARD_BUSY = "#2478B6FF"      # 处理中：青蓝 14% 底
 CARD_BUSY_HOVER = "#3578B6FF"
@@ -199,8 +199,12 @@ def _paint_subtitle_icon(p: QPainter, cx: int, cy: int) -> None:
 
 
 def _paint_summary_icon(p: QPainter, cx: int, cy: int) -> None:
-    """摘要兜底：彩虹环 + 白色实心文档（含灰线）+ 白色星芒（对标实机）。"""
-    _paint_rainbow_ring(p, cx, cy, 27)
+    """摘要兜底：白色实心文档（含灰线）+ 白色星芒。
+
+    2026-10-25 用户指出：原来这里还套了一圈彩虹渐变（_paint_rainbow_ring），
+    但 assets 里没有 panel_summary.png，那圈其实是代码画的 —— 与"三个卡片
+    都不要外圈"的要求冲突，已去掉（彩虹环函数保留但不再调用，备查）。
+    """
     w, h = 26, 30
     dx, dy = cx - w // 2, cy - h // 2
     p.setPen(Qt.PenStyle.NoPen)
@@ -300,18 +304,10 @@ class _CardBtn(QPushButton):
         side = ICON_SIDE
         iy = max(side // 2 + 2, int(r.height() * 0.45))
 
-        # ---- 图标光环：只有"点过"才画，一眼区分未点击 / 已开启 / 处理中 / 刚完成 ----
-        if accent is not None:
-            ring = QRect(cx - side // 2 - 6, iy - side // 2 - 6, side + 12, side + 12)
-            rc = QColor(accent)
-            rc.setAlpha(200)      # 光环压到文字区时透出字缝，不做成硬线条
-            if self._state == "busy":
-                # 缺口圆弧 ≈ 进行中（静态，不引定时器，避免面板常驻刷新）
-                p.setPen(QPen(rc, 2.0))
-                p.drawArc(ring, 90 * 16, -270 * 16)
-            else:
-                p.setPen(QPen(rc, 1.6))
-                p.drawEllipse(ring)
+        # ---- 不再画图标光环（2026-10-25 用户两次反馈：套圈压字、不好看）----
+        # active/busy/done 全部只靠 _STATE_STYLE 的配色 + 右上角标记区分：
+        # 实心点=已开启 / 空心圈=处理中 / 勾=刚完成。下方文字区完全空出来。
+        # （历史：这里曾按状态画整圈光环或 270° 缺口弧，与卡片文字重叠。）
 
         pm = panel_icon(self._icon)
         if pm is not None:
@@ -414,6 +410,7 @@ class AiPanel(QWidget):
     sig_close = pyqtSignal()        # ×
     sig_stop_rec = pyqtSignal()     # 录音态：停止并保存
     sig_pause_rec = pyqtSignal()    # 录音态：暂停/继续
+    sig_files_dropped = pyqtSignal(list)   # 拖文件进面板 → 手动摘要（2026-10-25）
 
     def __init__(self, cfg=None):
         super().__init__(None)
@@ -431,10 +428,15 @@ class AiPanel(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
         self.setObjectName("AiPanel")
         self.setStyleSheet("#AiPanel{background:#10141C;}")
+        # 2026-10-25：显式指定中文字体。原来不指定，中文全靠系统逐字回退
+        # （应用默认 Segoe UI 没有汉字）——实测同一行里会出现"有的字更粗更高"
+        # 的观感（不同回退字体混排）。雅黑 UI 是 Windows 中文界面的标准字体，
+        # 子控件继承这个 family；字号仍由各处 stylesheet 控制。
+        self.setFont(QFont("Microsoft YaHei UI", 9))
         self.setWindowOpacity(float(c.get("panel_opacity", 0.80) or 0.80))
         self.setWindowTitle("AI 语音摘记")
-        self.setFixedSize(PANEL_W, PANEL_H)      # 固定尺寸：内容与图标位置都不再随窗口变化而跳
-        self._base_h = PANEL_H                   # 常态高度（显示轻提示时会临时加高）
+        self.setAcceptDrops(True)                # 拖音频/文本进来 = 手动摘要
+        self.setFixedSize(PANEL_W, PANEL_H)      # 固定尺寸：从启动到退出都不再改（2026-10-25）
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -511,6 +513,10 @@ class AiPanel(QWidget):
         ar.addStretch(1)
         self._action_layout = ar
         self._action_btns = []
+        self._persistent_actions = None   # 常驻按钮组（2026-10-26）：toast 提示
+                                          # 收起按钮后自动恢复——"开启AI摘要"后那组
+                                          # 按钮要一直显示，不该被流程提示冲掉
+        self._rec_mode = None          # 录音控制条模式：recording / paused / None
         self._action_box.hide()
 
         self._toast_timer = QTimer(self)
@@ -559,13 +565,14 @@ class AiPanel(QWidget):
 
     def set_recording(self, on: bool, paused: bool = False) -> None:
         self._recording = bool(on)
+        # 2026-10-25 用户状态表：开始录音时一次性长到 226，停止后**不缩回**
+        # （原实现 stop 时 setFixedSize(186) → 紧接着动作按钮又撑到 226，一缩一涨）。
+        if on:
+            self._ensure_height(PANEL_H_REC)
         for b in (self._card_rec, self._card_sum, self._card_sub):
             b.setVisible(not on)
         self._rec_box.setVisible(on)
         self._btn_pause.setText("继续" if paused else "暂停")
-        # 录音态内容更高：面板随之加高（窗口为固定尺寸，adjustSize 无效）
-        self._base_h = REC_PANEL_H if on else PANEL_H
-        self.setFixedSize(PANEL_W, self._base_h)
         self._keep_on_screen()
 
     def set_time(self, text: str) -> None:
@@ -576,14 +583,49 @@ class AiPanel(QWidget):
 
     # ---------- 录音卡片：同一个按钮切换状态（2026-10-23 Q6=A）----------
 
-    REC_IDLE_TEXT = "● 开始应用录音"
+    # 2026-10-24 用户要求：按钮文字前的状态符号（● / ■）一律去掉，只留纯文字
+    REC_IDLE_TEXT = "开始应用录音"
 
-    def set_record_time(self, hms: str) -> None:
-        """录音中：卡片按钮文案变成「■ 录音中 HH:MM:SS」（点击它=停止并保存）。"""
-        self._card_rec.setText("■ 录音中 %s" % hms)
+    def set_record_time(self, hms: str = "") -> None:
+        """录音中：卡片文案固定「正在录音」（2026-10-25 用户要求）。
+
+        计时只在下方控制条显示——原来卡片上也带「录音中 HH:MM:SS」，
+        与控制条那行重复（用户截图反馈）。
+        """
+        self._card_rec.setText("正在录音")
+
+    def set_rec_controls(self, mode: str, text: str) -> None:
+        """底部录音控制条（2026-10-25 用户需求）。
+
+        mode:
+          "recording" → 「录音中 HH:MM:SS」+ [暂停][停止]
+          "paused"    → 「已暂停 HH:MM:SS」+ [继续][停止]
+          "none"      → 收起（回到普通提示区）
+        计时刷新走 update_rec_text()（只改文字，不重建按钮，避免每秒闪）。
+        """
+        if mode == "none":
+            self._rec_mode = None
+            # 2026-10-25 用户要求：停止瞬间不缩回——否则「缩回→三选项再加高」会弹一下；
+            # 保持高度，等三选项被点掉/下一条普通提示时再自然还原。
+            self._clear_actions(keep_height=True)
+            self._toast.hide()
+            return
+        self._rec_mode = mode
+        label = "暂停" if mode == "recording" else "继续"
+        self.toast_actions(text, [(label, self.sig_pause_rec.emit),
+                                  ("停止", self.sig_stop_rec.emit)])
+        self._rec_mode = mode          # toast_actions 开头会清模式，这里再设回
+
+    def update_rec_text(self, text: str) -> None:
+        """录音计时刷新：只改提示文字，不动按钮（避免重建闪烁）。"""
+        if not getattr(self, "_rec_mode", None):
+            return
+        self._toast.setText(text)
+        self._toast.adjustSize()
+        self._place_toast()
 
     def set_record_idle(self) -> None:
-        """空闲：卡片文案回到「● 开始应用录音」。"""
+        """空闲：卡片文案回到「开始应用录音」。"""
         self._card_rec.setText(self.REC_IDLE_TEXT)
 
     # ---------- 卡片状态（2026-10-20）----------
@@ -622,14 +664,23 @@ class AiPanel(QWidget):
         t.start(max(200, int(ms)))
 
     def toast(self, text: str, ms: int = 3000, warn: bool = False) -> None:
+        # 【常驻按钮组】本方法会 _clear_actions() 清掉按钮行；若当前存在
+        # "开启AI摘要"那组常驻按钮，清完立即重建——流程提示只顶替文字，
+        # 不吞按钮（2026-10-26 修"再次点摘要按钮就消失"）。
         """面板底部轻提示（自动消失，不打断操作）；warn=True 用警示色。
 
-        2026-10-18：面板是固定尺寸，把提示条直接塞进布局会挤压卡片、与图标重叠。
-        这里在显示期间把面板临时加高「一条提示」的高度，结束后还原。
+        2026-10-25：录音控制条（暂停/停止）显示期间，普通提示不覆盖它。
         """
-        self._clear_actions()
+        if getattr(self, "_rec_mode", None):
+            return
+        _persist = bool(getattr(self, "_persistent_actions", None))
+        self._clear_actions(keep_height=_persist)
+        if _persist:
+            # 【常驻按钮组】流程提示不清掉"开启AI摘要"那组按钮：清完立即重建
+            # （2026-10-26 修"再次点摘要按钮就消失"）。提示条照常短暂显示。
+            self._apply_actions(self._persistent_actions)
         self._toast.setStyleSheet(
-            "color:%s;font-size:12px;background:transparent;"
+            "color:%s;font-size:13px;background:transparent;"
             % ("#E0563F" if warn else FG_DIM))
         self._toast.setText(text)
         self._toast.adjustSize()
@@ -637,24 +688,61 @@ class AiPanel(QWidget):
         self._place_toast()
         self._toast_timer.start(ms)
 
-    def toast_actions(self, text: str, actions) -> None:
+    def toast_actions(self, text: str, actions, warn: bool = False) -> None:
         """底部轻提示 + 动作按钮（2026-10-23：独立录音窗移除后，"已保存"态
         的 打开目录 / 改名… / 丢弃 搬到这里——全程不弹窗，Q6=A）。
 
         actions: [(label, callback), ...]。有按钮时提示不自动消失，
-        点任一按钮 / 下一条提示到来时收起。
+        点任一按钮 / 下一条提示到来时收起。warn=True 用警示色（2026-10-25：
+        摘要没素材 / 转写失败时也走这套按钮）。
 
         2026-10-23 修复：按钮行占布局，186px 的固定高度放不下（曾与「开启
         字幕」卡片重叠 21px，见 _grow_for_actions 注释）。进入时临时加高。
         """
-        self._clear_actions()
+        self._rec_mode = None          # 普通动作调用：退出录音控制条模式
+        # 2026-10-25 用户实测"停止瞬间仍会弹"：本方法随后必然 _grow_for_actions 加高，
+        # 先缩回再加高就会闪一下——这里保持高度，让高度只增不减。
+        self._clear_actions(keep_height=True)
         self._grow_for_actions()
         self._toast.setStyleSheet(
-            "color:%s;font-size:13px;background:transparent;" % FG_TOAST)
+            "color:%s;font-size:13px;background:transparent;"
+            % ("#E0563F" if warn else FG_TOAST))
         self._toast.setText(text)
         self._toast.adjustSize()
         self._toast.show()
-        for label, cb in (actions or []):
+        self._persistent_actions = list(actions or [])   # 本组即"常驻组"
+        self._apply_actions(self._persistent_actions)
+        if self._action_btns:
+            self._place_actions()              # 贴底定位（绝对定位浮层，第 2 轮）
+            self._action_box.show()
+            self._toast_timer.stop()          # 有按钮：不自动消失
+        self._place_toast()
+
+    def _mk_action(self, cb, keep: bool = True):
+        """动作按钮回调。keep=True：点完**保留**按钮行（2026-10-25 用户要求：
+        打开摘要后往往还要打开文件夹，点一下就全收起太急）；
+        keep=False：破坏性操作（如"丢弃"）才就地收起。"""
+        def _go():
+            if not keep:
+                self._clear_actions()
+            try:
+                cb()
+            except Exception:  # noqa: BLE001
+                pass
+        return _go
+
+    def _apply_actions(self, actions) -> None:
+        """把 [(label, cb[, keep]) ...] 建成底部按钮行（toast_actions 与
+        常驻组恢复共用；2026-10-26 从 toast_actions 里抽出）。
+
+        必须自带 `_grow_for_actions()`：重建按钮时不加高，按钮会挤在 186 的
+        矮窗里压住卡片（2026-10-26 用户截图实测：窗口缩小 + 红字压按钮）。
+        """
+        if actions:
+            self._grow_for_actions()
+        for item in (actions or []):
+            label, cb = item[0], item[1]
+            keep = bool(item[2]) if len(item) > 2 else True    # 默认点完保留
             b = QPushButton(label, self._frame)
             b.setFixedHeight(26)
             b.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -662,25 +750,15 @@ class AiPanel(QWidget):
                 "QPushButton{background:rgba(255,255,255,0.16);border:none;"
                 "border-radius:8px;color:%s;font-size:12px;padding:0 12px;}"
                 "QPushButton:hover{background:rgba(255,255,255,0.28);}" % FG)
-            b.clicked.connect(self._mk_action(cb))
+            b.clicked.connect(self._mk_action(cb, keep))
             self._action_layout.addWidget(b)
             self._action_btns.append(b)
         if self._action_btns:
             self._place_actions()              # 贴底定位（绝对定位浮层，第 2 轮）
             self._action_box.show()
             self._toast_timer.stop()          # 有按钮：不自动消失
-        self._place_toast()
 
-    def _mk_action(self, cb):
-        def _go():
-            self._clear_actions()
-            try:
-                cb()
-            except Exception:  # noqa: BLE001
-                pass
-        return _go
-
-    def _clear_actions(self) -> None:
+    def _clear_actions(self, keep_height: bool = False) -> None:
         for b in getattr(self, "_action_btns", []):
             b.deleteLater()
         self._action_btns = []
@@ -690,31 +768,47 @@ class AiPanel(QWidget):
         toast = getattr(self, "_toast", None)
         if toast is not None:
             toast.hide()               # 按钮收起来，提示条一起收（toast() 会重新显示）
-        self._shrink_after_actions()
+        if not keep_height:
+            self._shrink_after_actions()
 
-    def _grow_for_actions(self) -> None:
-        """有动作按钮时把面板临时加高 ACTION_EXTRA_H（向下长，顶边不动）。
+    def _ensure_height(self, target_h: int) -> None:
+        """只增不减地调整窗口高度（2026-10-25 用户状态表）。
 
-        为什么加高：PANEL_H=186 是 10-19 按"纯文字 toast"定的（卡片底 164，
-        底部仅剩 22px）。按钮行是占布局控件（26px），总高度超限时 Qt 把它
-        挤进卡片区——实测与「开启字幕」卡片重叠 21px（dev/_diag_toast_overlap.py）。
-        加高后布局自然重排：卡片不动（顶边锚定），按钮行落到底部空白区。
-        重复调用幂等（已加高则跳过）；加高只改 setFixedSize，原点不变，
-        显式 move 回原位是双保险（防个别平台上 resize 引起原点漂移）。
+        顶边不动、向下长；已经是目标高度或更高就什么都不做——
+        这是"停止录音不缩回"的唯一保证点：全程序没有任何把高度调小的路径。
         """
-        if self.height() >= PANEL_H + ACTION_EXTRA_H:
+        if self.height() >= target_h:
             return
         pos = self.pos()
-        self.setFixedSize(PANEL_W, PANEL_H + ACTION_EXTRA_H)
-        self.move(pos)                    # 顶边不动，向下长
+        self.setFixedSize(PANEL_W, target_h)
+        self.move(pos)                    # 顶边锚定（个别平台上 resize 会挪原点）
+        try:
+            if self._toast.isVisible():
+                self._place_toast()       # 高度变了，提示重新居中
+        except Exception:                 # noqa: BLE001
+            pass
+
+    def _grow_for_actions(self) -> None:
+        """动作按钮行需要 226 高度：只增不减地保证（原有调用点保留）。"""
+        self._ensure_height(PANEL_H_REC)
 
     def _shrink_after_actions(self) -> None:
-        """动作按钮收起后还原面板高度（与 _grow_for_actions 成对）。"""
+        """动作按钮收起后缩回启动高度 186（2026-10-25 用户状态表）。
+
+        只有"收起选项"这一个刻意动作会变矮（点任一选项 / 下一条普通提示到来）；
+        录音停止那一瞬间**不**走这里（`set_recording(False)` 不改尺寸），
+        所以不会再出现"停止先缩回、选项又撑开"的闪动。
+        """
         if self.height() <= PANEL_H:
             return
         pos = self.pos()
         self.setFixedSize(PANEL_W, PANEL_H)
-        self.move(pos)                    # 顶边不动，底边上收
+        self.move(pos)                    # 顶边锚定，底边上收
+        try:
+            if self._toast.isVisible():
+                self._place_toast()       # 高度变了，提示重新居中
+        except Exception:                 # noqa: BLE001
+            pass
 
     def _place_actions(self) -> None:
         """把动作按钮行钉在窗口底部：距底边 ACTION_GAP_BOTTOM（6px），高 26。
@@ -731,8 +825,13 @@ class AiPanel(QWidget):
         box.raise_()                     # 浮层：保证压在卡片/提示之上
 
     def _toast_hide(self) -> None:
-        self._clear_actions()
+        """提示条到点收起。**常驻按钮组必须留下**（2026-10-26 用户实测：
+        点完按钮 3 秒后整组消失、窗口跟着缩回）。"""
+        _persist = bool(getattr(self, "_persistent_actions", None))
+        self._clear_actions(keep_height=_persist)
         self._toast.hide()
+        if _persist:
+            self._apply_actions(self._persistent_actions)
 
     def _place_toast(self) -> None:
         """把提示放在"卡片以下整个区域（直到窗口底边）"的垂直正中。
@@ -758,6 +857,34 @@ class AiPanel(QWidget):
             self._toast.setGeometry(16, y, self._frame.width() - 32, h)
         except Exception:  # noqa: BLE001
             pass
+
+    # ---------- 拖放：把音频/文本拖进面板 = 手动摘要（2026-10-25） ----------
+
+    def dragEnterEvent(self, e):  # noqa: N802
+        md = e.mimeData()
+        if md is not None and md.hasUrls() and any(
+                u.isLocalFile() for u in md.urls()):
+            e.acceptProposedAction()
+            try:
+                self.toast("松开即可摘要这个文件（音频→先转写，文本→直接摘要）", 2500)
+            except Exception:                     # noqa: BLE001
+                pass
+        else:
+            e.ignore()
+
+    def dragMoveEvent(self, e):  # noqa: N802
+        if e.mimeData() is not None and e.mimeData().hasUrls():
+            e.acceptProposedAction()
+
+    def dropEvent(self, e):  # noqa: N802
+        md = e.mimeData()
+        paths = [u.toLocalFile() for u in md.urls()] if md is not None else []
+        paths = [p for p in paths if p and os.path.isfile(p)]
+        if not paths:
+            e.ignore()
+            return
+        e.acceptProposedAction()
+        self.sig_files_dropped.emit(paths)
 
     # ---------- 位置 / 拖动 ----------
 

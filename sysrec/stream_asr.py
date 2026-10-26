@@ -43,12 +43,18 @@ class StreamingASR:
     """
 
     def __init__(self, threads: int = 2, endpoint_rule1_silence: float = 0.4,
-                 endpoint_max_utterance: float = 60.0):
+                 endpoint_max_utterance: float = 60.0, provider: str = "cpu",
+                 device: int = 0):
         self._threads = max(1, int(threads))
         self._rec = None
         self._lock = threading.Lock()
         self._rule1 = max(0.1, float(endpoint_rule1_silence))
         self._rule3 = max(5.0, float(endpoint_max_utterance))
+        # 默认 cpu：2026-10-24 实测流式上 GPU 慢 3 倍（小块增量解码的 kernel
+        # 启动开销），要上 GPU 必须显式传 "cuda"（config: subtitle_provider）。
+        self._provider_pref = (provider or "cpu").strip().lower()
+        self._device = int(device or 0)
+        self.provider = "cpu"          # ensure() 时定稿
 
     def ready(self) -> bool:
         return all(os.path.exists(p) for p in (ENCODER, DECODER, TOKENS))
@@ -61,6 +67,19 @@ class StreamingASR:
                 return self._rec
             if not self.ready():
                 raise RuntimeError("流式模型不完整：%s" % MODEL_DIR)
+            from . import gpu
+            gpu.ensure_cuda_dlls()               # CUDA provider DLL 前置依赖（幂等）
+            self.provider = gpu.resolve_provider(self._provider_pref)
+            try:
+                import datetime
+                from . import app_paths
+                log = os.path.join(app_paths.data_path(), "startup.log")
+                with open(log, "a", encoding="utf-8") as f:
+                    f.write("[%s] 流式 Paraformer provider=%s（配置 subtitle_provider=%s）\n"
+                            % (datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                               self.provider, self._provider_pref))
+            except Exception:                              # noqa: BLE001
+                pass
             import sherpa_onnx
             self._rec = sherpa_onnx.OnlineRecognizer.from_paraformer(
                 encoder=ENCODER,
@@ -73,6 +92,8 @@ class StreamingASR:
                 enable_endpoint_detection=True,            # 句尾静音断句（rule1）
                 rule1_min_trailing_silence=self._rule1,
                 rule3_min_utterance_length=self._rule3,    # 超长兜底
+                provider=self.provider,
+                device=self._device,
             )
             return self._rec
 
